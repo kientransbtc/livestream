@@ -607,36 +607,40 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           textAlign: TextAlign.center,
           style: TextStyle(color: Colors.white70, height: 1.4),
         ),
-        actionsAlignment: MainAxisAlignment.end,
         actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
         actions: [
-          Expanded(
-            child: OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                foregroundColor: Colors.white,
-                side: const BorderSide(color: Colors.white24),
-                minimumSize: const Size(96, 46),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                    side: const BorderSide(color: Colors.white24),
+                    minimumSize: const Size(96, 46),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Ở lại'),
                 ),
               ),
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Ở lại'),
-            ),
-          ),
-          Expanded(
-            child: FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: const Color(0xFFE44F68),
-                foregroundColor: Colors.white,
-                minimumSize: const Size(96, 46),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFE44F68),
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(96, 46),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Thoát'),
                 ),
               ),
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Thoát'),
-            ),
+            ],
           ),
         ],
       ),
@@ -1338,6 +1342,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       surfaceTintColor: Colors.transparent,
       elevation: 0,
       titleSpacing: 16,
+      iconTheme: IconThemeData(color: Colors.white),
       title: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
