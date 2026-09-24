@@ -46,3 +46,6 @@ app.*.map.json
 
 # FVM Version Cache
 .fvm/ios/ZoomSDK/
+
+# Local developer account notes must never be committed.
+/READMEACCOUNT.md
