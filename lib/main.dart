@@ -1,0 +1,2986 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:livekit_client/livekit_client.dart';
+
+// LiveKit 2.13.0 does not export its broadcast controls from the main library.
+// ignore: implementation_imports
+import 'package:livekit_client/src/managers/broadcast_manager.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+import 'demo_livekit_token.dart';
+import 'live_chat.dart';
+import 'live_chat_overlay.dart';
+import 'media_access.dart';
+import 'screen_share.dart';
+
+void main() {
+  BroadcastManager().shouldPublishTrack = false;
+  runApp(const LiveKitDemoApp());
+}
+
+class LiveKitDemoApp extends StatelessWidget {
+  const LiveKitDemoApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'hisale live',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF168BE7)),
+      ),
+      home: const LiveKitDemoPage(),
+    );
+  }
+}
+
+///
+/// Demo này dùng data packet để mô phỏng việc host duyệt giơ tay. Khi làm thật,
+/// BE phải kiểm quyền và gọi UpdateParticipant của LiveKit; không tin quyết định
+/// approve từ một client khác.
+class LiveKitDemoPage extends StatefulWidget {
+  const LiveKitDemoPage({
+    super.key,
+    this.initialRoomName,
+    this.initialRoomTitle,
+    this.initialParticipantName,
+    this.serverUrl,
+    this.participantToken,
+    this.initialRole,
+    this.autoConnect = false,
+    this.appBarAction,
+  });
+
+  /// Optional values used by the HiSale host app. When omitted, the page
+  /// keeps the standalone demo flow and creates a local demo token.
+  final String? initialRoomName;
+  final String? initialRoomTitle;
+  final String? initialParticipantName;
+  final String? serverUrl;
+  final String? participantToken;
+  final String? initialRole;
+  final bool autoConnect;
+  final Widget? appBarAction;
+
+  @override
+  State<LiveKitDemoPage> createState() => _LiveKitDemoPageState();
+}
+
+class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
+  final _roomController = TextEditingController();
+  final _nameController = TextEditingController();
+  final _joinFormKey = GlobalKey<FormState>();
+  final _mediaAccess = MediaAccess();
+  final ValueNotifier<Room?> _roomNotifier = ValueNotifier(null);
+  final ValueNotifier<int> _preJoinRevision = ValueNotifier(0);
+  final ValueNotifier<int> _meetingRevision = ValueNotifier(0);
+
+  Room? _room;
+  EventsListener<RoomEvent>? _listener;
+  LiveChatController? _chat;
+  ScreenShareController? _screenShare;
+  bool _focusedScreen = false;
+  String? _connectedRoomName;
+  String? _knownHostIdentity;
+  bool _roomRefreshScheduled = false;
+  bool _roomRefreshNeedsHostResolve = false;
+  bool _connecting = false;
+  bool _handRaised = false;
+  bool _approved = false;
+  bool _screenShareApproved = false;
+  bool _changingMic = false;
+  bool _changingCamera = false;
+  bool _turningCameraOffForScreenShare = false;
+  CameraPosition _cameraPosition = CameraPosition.front;
+  bool _resolvingHost = false;
+  bool _fullScreen = false;
+  String? _focusedIdentity;
+  String? _hostNotice;
+  String? _error;
+  final Set<String> _waitingIdentities = <String>{};
+
+  void _refreshPreJoin() => _preJoinRevision.value++;
+
+  void _refreshMeeting() => _meetingRevision.value++;
+
+  bool get _isBackendAutoConnect =>
+      widget.autoConnect && widget.participantToken?.trim().isNotEmpty == true;
+
+  @override
+  void initState() {
+    super.initState();
+    _roomController.text = widget.initialRoomName ?? '';
+    _nameController.text = widget.initialParticipantName ?? '';
+    if (widget.initialRole?.toLowerCase() == _DemoRole.host.name) {
+      _role = _DemoRole.host;
+    }
+    if (widget.autoConnect) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_connect());
+      });
+    }
+  }
+
+  bool get _isHost => (_connectedRole ?? _role) == _DemoRole.host;
+  _DemoRole _role = _DemoRole.audience;
+  _DemoRole? _connectedRole;
+
+  bool get _micEnabled =>
+      _room?.localParticipant?.isMicrophoneEnabled() ?? false;
+
+  bool get _cameraEnabled =>
+      _room?.localParticipant?.isCameraEnabled() ?? false;
+
+  bool get _canUseMicrophone => _isHost || _approved;
+
+  bool get _canShareScreen => _isHost || _screenShareApproved;
+
+  bool get _needsHostApproval => !_canUseMicrophone || !_canShareScreen;
+
+  List<Participant> get _participants => [
+    if (_room?.localParticipant != null) _room!.localParticipant!,
+    ...?_room?.remoteParticipants.values,
+  ];
+
+  Map<String, dynamic> _participantMetadata(Participant participant) {
+    try {
+      final value = jsonDecode(participant.metadata ?? '{}');
+      return value is Map<String, dynamic> ? value : {};
+    } on FormatException {
+      return {};
+    }
+  }
+
+  Participant? get _hostParticipant {
+    final candidates = _participants.where((participant) {
+      if (participant == _room?.localParticipant &&
+          _connectedRole != _DemoRole.host) {
+        return false;
+      }
+      return _participantMetadata(participant)['role'] == 'host';
+    }).toList();
+    candidates.sort((a, b) {
+      // An established host keeps the room when another host joins. Concurrent
+      // claims use the same server join time + identity ordering on every client.
+      final aClaiming = _participantMetadata(a)['host_state'] == 'claiming';
+      final bClaiming = _participantMetadata(b)['host_state'] == 'claiming';
+      if (aClaiming != bClaiming) return aClaiming ? 1 : -1;
+      final joinedOrder = a.joinedAt.compareTo(b.joinedAt);
+      return joinedOrder != 0 ? joinedOrder : a.identity.compareTo(b.identity);
+    });
+    return candidates.firstOrNull;
+  }
+
+  Future<void> _resolveHost() async {
+    final room = _room;
+    final local = room?.localParticipant;
+    if (room == null || local == null || !_isHost || _resolvingHost) return;
+    final host = _hostParticipant;
+    if (host == null) return;
+    _resolvingHost = true;
+    try {
+      if (host.identity != local.identity) {
+        if (!mounted) return;
+        _connectedRole = _DemoRole.audience;
+        _approved = false;
+        _screenShareApproved = false;
+        _hostNotice =
+            'Phòng đã có host. Bạn chỉ tham gia với tư cách thành viên.';
+        _refreshMeeting();
+        await local.setMicrophoneEnabled(false);
+        await local.setMetadata(jsonEncode({'role': 'audience'}));
+      } else if (_participantMetadata(local)['host_state'] == 'claiming') {
+        await local.setMetadata(
+          jsonEncode({'role': 'host', 'host_state': 'active'}),
+        );
+      }
+    } catch (_) {
+      if (_room == room) {
+        await _disconnect(
+          message:
+              'Chưa đồng bộ được vai trò trong phòng. Bấm Vào phòng để thử lại.',
+        );
+      }
+    } finally {
+      _resolvingHost = false;
+      if (mounted && _room == room) {
+        _refreshMeeting();
+        if (_isHost && _hostParticipant?.identity != local.identity) {
+          unawaited(_resolveHost());
+        }
+      }
+    }
+  }
+
+  void _refreshParticipants() {
+    if (!mounted || _room == null) return;
+    final host = _hostParticipant;
+    if (host != null) _knownHostIdentity = host.identity;
+    // Room events can arrive while no Flutter frame is scheduled (for example,
+    // when a participant joins without publishing video). Notify the meeting
+    // builder immediately, then reconcile focus and host state after this frame.
+    _refreshMeeting();
+    _scheduleRoomRefresh(resolveHost: true);
+  }
+
+  void _scheduleRoomRefresh({required bool resolveHost}) {
+    if (!mounted || _room == null) return;
+    _roomRefreshNeedsHostResolve = _roomRefreshNeedsHostResolve || resolveHost;
+    if (_roomRefreshScheduled) return;
+    _roomRefreshScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final shouldResolveHost = _roomRefreshNeedsHostResolve;
+      _roomRefreshNeedsHostResolve = false;
+      _roomRefreshScheduled = false;
+      if (!mounted || _room == null) return;
+      final participants = _participants;
+      final identities = participants.map((p) => p.identity).toSet();
+      _waitingIdentities.removeWhere(
+        (identity) => !identities.contains(identity),
+      );
+      if (_focusedIdentity != null && !identities.contains(_focusedIdentity)) {
+        _focusedIdentity = null;
+        _focusedScreen = false;
+        _fullScreen = false;
+      }
+      if (_focusedScreen &&
+          !participants.any(
+            (p) => p.identity == _focusedIdentity && p.isScreenShareEnabled(),
+          )) {
+        _focusedIdentity = null;
+        _focusedScreen = false;
+        _fullScreen = false;
+      }
+      _refreshMeeting();
+      if (shouldResolveHost) unawaited(_resolveHost());
+    });
+  }
+
+  @override
+  void dispose() {
+    final room = _room;
+    final listener = _listener;
+    final chat = _chat;
+    final share = _screenShare;
+    _room = null;
+    _listener = null;
+    _chat = null;
+    _screenShare = null;
+    // Start the LiveKit leave signal before awaiting screen-share cleanup.
+    // iOS can still be waiting for the ReplayKit picker/broadcast callback.
+    final disconnection = room?.disconnect();
+    chat?.dispose();
+    listener?.dispose();
+    room?.removeListener(_refreshParticipants);
+    unawaited(() async {
+      try {
+        await share?.close();
+      } catch (_) {}
+      try {
+        await disconnection;
+      } catch (_) {}
+      try {
+        await room?.dispose();
+      } catch (_) {}
+    }());
+    _roomController.dispose();
+    _nameController.dispose();
+    _roomNotifier.dispose();
+    _preJoinRevision.dispose();
+    _meetingRevision.dispose();
+    super.dispose();
+  }
+
+  Future<void> _connect() async {
+    if (_connecting || _room != null) return;
+    final usesBackendToken = widget.participantToken?.trim().isNotEmpty == true;
+    if (!usesBackendToken &&
+        !(_joinFormKey.currentState?.validate() ?? false)) {
+      return;
+    }
+    final roomName =
+        (widget.initialRoomName?.trim().isNotEmpty == true
+                ? widget.initialRoomName
+                : _roomController.text)
+            .toString()
+            .trim();
+    final participantName =
+        (widget.initialParticipantName?.trim().isNotEmpty == true
+                ? widget.initialParticipantName
+                : _nameController.text)
+            .toString()
+            .trim();
+    if (roomName.isEmpty || participantName.isEmpty) {
+      if (mounted) {
+        _error = 'Thiếu thông tin phòng hoặc tên người dùng.';
+        _refreshPreJoin();
+      }
+      return;
+    }
+
+    FocusScope.of(context).unfocus();
+    final selectedRole = _role;
+    Room? pendingRoom;
+    EventsListener<RoomEvent>? pendingListener;
+    LiveChatController? pendingChat;
+    _connecting = true;
+    _error = null;
+    _hostNotice = null;
+    _refreshPreJoin();
+    try {
+      final token = usesBackendToken
+          ? widget.participantToken!.trim()
+          : createDemoLiveKitToken(
+              room: roomName,
+              participantName: participantName,
+              role: selectedRole.name,
+            );
+      final serverUrl = widget.serverUrl?.trim().isNotEmpty == true
+          ? widget.serverUrl!.trim()
+          : liveKitDemoUrl;
+      final room = Room(
+        roomOptions: const RoomOptions(
+          adaptiveStream: true,
+          dynacast: true,
+          defaultCameraCaptureOptions: CameraCaptureOptions(
+            cameraPosition: CameraPosition.front,
+          ),
+          defaultScreenShareCaptureOptions: ScreenShareCaptureOptions(
+            useiOSBroadcastExtension: true,
+            maxFrameRate: 15,
+            // 720p keeps documents readable while reducing mobile encoding
+            // and uplink pressure compared with the 1080p default preset.
+            params: VideoParametersPresets.screenShareH720FPS15,
+          ),
+        ),
+      );
+      pendingRoom = room;
+      // Register before connecting so chat sent just after joining is received.
+      final chat = LiveChatController.forRoom(
+        room,
+        localDisplayName: widget.initialParticipantName,
+      );
+      pendingChat = chat;
+      final listener = room.createListener();
+      pendingListener = listener;
+      listener.on<DataReceivedEvent>(_onDataReceived);
+      listener.on<RoomDisconnectedEvent>((event) {
+        if (!mounted || _room != room) return;
+        unawaited(
+          _disconnect(
+            message:
+                'Đã ngắt kết nối LiveKit (${event.reason ?? 'không rõ nguyên nhân'}). Bấm Vào phòng để thử lại.',
+          ),
+        );
+      });
+      listener.on<ParticipantConnectedEvent>((_) {
+        _refreshParticipants();
+      });
+      listener.on<ParticipantDisconnectedEvent>((event) {
+        final participantWasHost =
+            event.participant.identity == _knownHostIdentity ||
+            _participantMetadata(event.participant)['role'] == 'host';
+        if (participantWasHost && !_isHost) {
+          _knownHostIdentity = null;
+          _hostNotice = 'Chủ phòng đã rời khỏi phòng.';
+        }
+        _refreshParticipants();
+      });
+      listener.on<ParticipantMetadataUpdatedEvent>(
+        (_) => _refreshParticipants(),
+      );
+      listener.on<ParticipantNameUpdatedEvent>((_) => _refreshParticipants());
+      listener.on<RoomReconnectedEvent>((_) => _refreshParticipants());
+      listener.on<TrackMutedEvent>((_) => _refreshParticipants());
+      listener.on<TrackUnmutedEvent>((_) => _refreshParticipants());
+      listener.on<TrackPublishedEvent>((event) {
+        _onScreenPublished(event.participant, event.publication.source);
+        _refreshParticipants();
+      });
+      listener.on<TrackUnpublishedEvent>((_) => _refreshParticipants());
+      listener.on<TrackSubscribedEvent>((_) {
+        if (mounted) _refreshMeeting();
+      });
+      listener.on<TrackUnsubscribedEvent>((_) {
+        if (mounted) _refreshMeeting();
+      });
+      listener.on<LocalTrackPublishedEvent>((event) {
+        _onScreenPublished(event.participant, event.publication.source);
+        _refreshParticipants();
+      });
+      listener.on<LocalTrackUnpublishedEvent>((_) {
+        _refreshParticipants();
+      });
+      // Keep remote audio/video subscriptions enabled for incoming participants.
+      await room.connect(
+        serverUrl,
+        token,
+        connectOptions: const ConnectOptions(autoSubscribe: true),
+      );
+      if (!mounted) {
+        chat.dispose();
+        await listener.dispose();
+        await room.dispose();
+        return;
+      }
+      _room = room;
+      room.addListener(_refreshParticipants);
+      _knownHostIdentity = _hostParticipant?.identity;
+      _connectedRoomName = roomName;
+      _screenShare = ScreenShareController.forRoom(room)
+        ..addListener(_onScreenShareChanged);
+      _listener = listener;
+      _chat = chat..addListener(_refreshChat);
+      _connectedRole = selectedRole;
+      _roomNotifier.value = room;
+      _syncLocalParticipantName(room);
+      _refreshMeeting();
+      if (!room.localParticipant!.permissions.canSubscribe) {
+        _showMediaError(
+          'Token LiveKit chưa cấp quyền nghe track. BE cần cấp canSubscribe=true cho thành viên.',
+        );
+      }
+      await _resolveHost();
+      // Join without capture. Each media button requests its device permission
+      // before starting capture; a denied camera never prevents mic access.
+    } catch (e) {
+      pendingChat?.dispose();
+      await pendingListener?.dispose();
+      await pendingRoom?.dispose();
+      if (mounted) {
+        _room = null;
+        _listener = null;
+        _chat = null;
+        _screenShare = null;
+        _connectedRoomName = null;
+        _connectedRole = null;
+        _error = 'Không kết nối được LiveKit: ${_errorMessage(e)}';
+        _roomNotifier.value = null;
+        _refreshPreJoin();
+      }
+    } finally {
+      if (mounted) {
+        _connecting = false;
+        _refreshPreJoin();
+      }
+    }
+  }
+
+  String _errorMessage(Object error) => error
+      .toString()
+      .replaceAll(
+        RegExp(r'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'),
+        '[token]',
+      )
+      .replaceFirst('Bad state: ', '');
+
+  void _syncLocalParticipantName(Room room) {
+    final localParticipant = room.localParticipant;
+    final displayName = widget.initialParticipantName?.trim() ?? '';
+    if (localParticipant == null ||
+        displayName.isEmpty ||
+        localParticipant.name.trim() == displayName ||
+        !localParticipant.permissions.canUpdateMetadata) {
+      return;
+    }
+
+    unawaited(() async {
+      try {
+        await localParticipant.setName(displayName);
+      } catch (_) {
+        // The token may not allow name updates; local UI still uses displayName.
+      }
+    }());
+  }
+
+  void _showMediaError(String message) {
+    if (!mounted || _room == null) return;
+    final mediaQuery = MediaQuery.of(context);
+    final bottomGap =
+        82.0 + mediaQuery.viewPadding.bottom + mediaQuery.viewInsets.bottom;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          margin: EdgeInsets.fromLTRB(16, 0, 16, bottomGap),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: const BorderSide(color: Color(0xFF6AA9D8)),
+          ),
+          backgroundColor: const Color(0xFF1B3047),
+          content: Text(message),
+        ),
+      );
+  }
+
+  Future<void> _disconnect({String? message}) async {
+    final room = _room;
+    final listener = _listener;
+    final chat = _chat;
+    final share = _screenShare;
+    room?.removeListener(_refreshParticipants);
+    _screenShare = null;
+    _listener = null;
+    _room = null;
+    _chat = null;
+    _connectedRoomName = null;
+    _knownHostIdentity = null;
+    _connectedRole = null;
+    // Notify LiveKit immediately. Waiting for a pending screen-share operation
+    // first can delay the server's participant-disconnected event by seconds.
+    final disconnection = room?.disconnect();
+    _roomNotifier.value = null;
+    if (mounted) {
+      _waitingIdentities.clear();
+      _handRaised = false;
+      _approved = false;
+      _screenShareApproved = false;
+      _changingMic = false;
+      _changingCamera = false;
+      _turningCameraOffForScreenShare = false;
+      _cameraPosition = CameraPosition.front;
+      _focusedIdentity = null;
+      _fullScreen = false;
+      _hostNotice = null;
+      _error = message;
+      _focusedScreen = false;
+      _connecting = true;
+      _refreshMeeting();
+      _refreshPreJoin();
+    }
+    chat?.dispose();
+    try {
+      await listener?.dispose();
+    } catch (_) {}
+    try {
+      await share?.close();
+    } catch (_) {}
+    try {
+      await disconnection;
+    } catch (_) {}
+    try {
+      await room?.dispose();
+    } catch (_) {}
+    if (mounted) {
+      _connecting = false;
+      _refreshPreJoin();
+    }
+  }
+
+  Future<void> _exitApplication() async {
+    if (!mounted) return;
+    final shouldExit = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF222630),
+        surfaceTintColor: Colors.transparent,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: const BorderSide(color: Colors.white12),
+        ),
+        icon: Container(
+          width: 52,
+          height: 52,
+          decoration: BoxDecoration(
+            color: const Color(0xFFFF657A).withValues(alpha: 0.14),
+            shape: BoxShape.circle,
+          ),
+          child: const Icon(Icons.logout_rounded, color: Color(0xFFFF7184)),
+        ),
+        title: const Text(
+          'Thoát hisale live?',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 20,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        content: const Text(
+          'Bạn sẽ rời khỏi phòng hiện tại.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.white70, height: 1.4),
+        ),
+        actionsAlignment: MainAxisAlignment.end,
+        actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+        actions: [
+          Expanded(
+            child: OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white,
+                side: const BorderSide(color: Colors.white24),
+                minimumSize: const Size(96, 46),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Ở lại'),
+            ),
+          ),
+          Expanded(
+            child: FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFE44F68),
+                foregroundColor: Colors.white,
+                minimumSize: const Size(96, 46),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Thoát'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (shouldExit != true) return;
+    final cleanup = _disconnect();
+    if (!mounted) return;
+    final didPop = await Navigator.of(context).maybePop();
+    if (!didPop) await SystemNavigator.pop();
+    await cleanup;
+  }
+
+  void _refreshChat() {
+    // Chat notifications must rebuild the toolbar immediately. A post-frame
+    // participant refresh can otherwise leave the unread badge stale while a
+    // native camera platform view is running.
+    if (mounted) _refreshMeeting();
+  }
+
+  void _onScreenShareChanged() {
+    _refreshChat();
+    // Stop the camera only after the screen-share track is really active. This
+    // keeps the camera on when the iOS broadcast permission sheet is cancelled.
+    if (_screenShare?.active == true &&
+        _cameraEnabled &&
+        !_turningCameraOffForScreenShare) {
+      unawaited(_disableCameraForScreenShare());
+    }
+  }
+
+  Future<void> _disableCameraForScreenShare() async {
+    final room = _room;
+    final local = room?.localParticipant;
+    if (_turningCameraOffForScreenShare ||
+        room == null ||
+        local == null ||
+        !local.isCameraEnabled()) {
+      return;
+    }
+
+    _turningCameraOffForScreenShare = true;
+    try {
+      await local.setCameraEnabled(false);
+      if (mounted && _room == room) {
+        _cameraPosition = CameraPosition.front;
+        _refreshMeeting();
+      }
+    } catch (error) {
+      if (mounted && _room == room) {
+        _reportMediaFailure(MeetingMedia.camera, error);
+      }
+    } finally {
+      _turningCameraOffForScreenShare = false;
+      if (mounted && _room == room) _refreshMeeting();
+    }
+  }
+
+  void _toggleChat() {
+    final chat = _chat;
+
+    if (chat == null) return;
+
+    if (chat.visible) {
+      FocusScope.of(context).unfocus();
+    }
+
+    chat.toggleVisibility();
+  }
+
+  void _onDataReceived(DataReceivedEvent event) {
+    if (!mounted || event.topic != 't65-demo-control') return;
+    Map<String, dynamic> message;
+    try {
+      final decoded = jsonDecode(utf8.decode(event.data));
+      if (decoded is! Map<String, dynamic>) return;
+      message = decoded;
+    } on FormatException {
+      return;
+    }
+    final type = message['type'];
+    final sender = event.participant?.identity;
+    if (type == 'hand_raise' && _isHost && sender != null) {
+      _waitingIdentities.add(sender);
+      _refreshMeeting();
+    } else if (type == 'hand_cancel' && _isHost && sender != null) {
+      _waitingIdentities.remove(sender);
+      _refreshMeeting();
+    } else if (type == 'hand_approved' &&
+        !_isHost &&
+        sender == _hostParticipant?.identity) {
+      // Ignore an approval packet already in flight if the member canceled
+      // their request before it arrived.
+      if (!_handRaised) return;
+      // The host explicitly chooses each capability. In a real room the
+      // backend must enforce the same grants with LiveKit permissions.
+      final allowMic = message['allow_mic'] == true;
+      final allowScreenShare = message['allow_screen_share'] == true;
+      final micWasApproved = _approved;
+      final screenShareWasApproved = _screenShareApproved;
+      // Keep previous grants when the host approves another capability later.
+      _approved = _approved || allowMic;
+      _screenShareApproved = _screenShareApproved || allowScreenShare;
+      _handRaised = false;
+      _hostNotice = _approved && _screenShareApproved
+          ? 'Host đã duyệt mic và chia sẻ màn hình cho bạn.'
+          : _approved
+          ? 'Host đã duyệt mic cho bạn.'
+          : _screenShareApproved
+          ? 'Host đã duyệt chia sẻ màn hình cho bạn.'
+          : 'Host chưa cấp quyền phát biểu cho bạn.';
+      _refreshMeeting();
+      if ((!micWasApproved && _approved) ||
+          (!screenShareWasApproved && _screenShareApproved)) {
+        _showMediaError(
+          'Host đã duyệt. Bạn có thể bật mic hoặc chia sẻ màn hình.',
+        );
+      }
+    } else if (type == 'hand_rejected' &&
+        !_isHost &&
+        sender == _hostParticipant?.identity) {
+      if (!_handRaised) return;
+      _handRaised = false;
+      _hostNotice = _approved || _screenShareApproved
+          ? 'Host từ chối yêu cầu quyền bổ sung. Quyền đã duyệt trước đó vẫn được giữ.'
+          : 'Host chưa duyệt quyền phát biểu của bạn.';
+      _refreshMeeting();
+    }
+  }
+
+  Future<void> _send(
+    Map<String, dynamic> message, {
+    String? destination,
+  }) async {
+    final room = _room;
+    if (room == null) return;
+    await room.localParticipant?.publishData(
+      utf8.encode(jsonEncode(message)),
+      reliable: true,
+      destinationIdentities: destination == null ? null : [destination],
+      topic: 't65-demo-control',
+    );
+  }
+
+  Future<void> _raiseHand() async {
+    final room = _room;
+    if (room == null || _isHost || _handRaised || !_needsHostApproval) return;
+
+    // Set this before sending: the host can approve immediately, and the
+    // response must not be discarded as arriving before the request state.
+    _handRaised = true;
+    _hostNotice = 'Đã giơ tay. Vui lòng chờ host duyệt quyền cần dùng.';
+    _refreshMeeting();
+    try {
+      await _send({'type': 'hand_raise'});
+    } catch (_) {
+      if (mounted && _room == room && _handRaised) {
+        _handRaised = false;
+        _hostNotice = 'Chưa gửi được yêu cầu. Vui lòng thử giơ tay lại.';
+        _refreshMeeting();
+        _showMediaError('Chưa gửi được yêu cầu giơ tay. Vui lòng thử lại.');
+      }
+    }
+  }
+
+  Future<void> _cancelHandRaise() async {
+    final room = _room;
+    if (room == null || !_handRaised || _changingMic || _changingCamera) {
+      return;
+    }
+
+    _changingMic = true;
+    _handRaised = false;
+    _refreshMeeting();
+    try {
+      await _send({'type': 'hand_cancel'});
+    } catch (error) {
+      if (mounted && _room == room) {
+        _handRaised = true;
+        _refreshMeeting();
+        _showMediaError('Chưa hủy được yêu cầu. Vui lòng thử lại.');
+      }
+    } finally {
+      if (mounted && _room == room) {
+        _changingMic = false;
+        _refreshMeeting();
+      }
+    }
+  }
+
+  Future<void> _approve(
+    String identity, {
+    required bool allowMic,
+    required bool allowScreenShare,
+  }) async {
+    if (!_isHost || _room == null) return;
+    await _send({
+      'type': 'hand_approved',
+      'allow_mic': allowMic,
+      'allow_screen_share': allowScreenShare,
+    }, destination: identity);
+    if (mounted) {
+      _waitingIdentities.remove(identity);
+      _refreshMeeting();
+    }
+  }
+
+  Future<void> _showApprovalDialog([String? identity]) async {
+    if (!_isHost || _room == null) return;
+    if (identity == null && _waitingIdentities.isEmpty) return;
+
+    final participant = identity == null
+        ? null
+        : _participants.where((p) => p.identity == identity).firstOrNull;
+    final participantName = participant == null
+        ? 'tất cả người đang chờ'
+        : (participant.name.isEmpty ? 'Thành viên' : participant.name);
+    final dialogState = ValueNotifier(const _ApprovalDialogState());
+    final choice = await showDialog<_ApprovalChoice>(
+      context: context,
+      builder: (dialogContext) => ValueListenableBuilder<_ApprovalDialogState>(
+        valueListenable: dialogState,
+        builder: (context, state, _) => AlertDialog(
+          backgroundColor: const Color(0xFF222630),
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(24),
+            side: const BorderSide(color: Colors.white12),
+          ),
+          titlePadding: const EdgeInsets.fromLTRB(22, 22, 22, 8),
+          contentPadding: const EdgeInsets.fromLTRB(22, 0, 22, 8),
+          actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+          title: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: const Icon(
+                  Icons.admin_panel_settings_outlined,
+                  color: Color(0xFF70C7FF),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  identity == null ? 'Duyệt người tham gia' : 'Duyệt quyền',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 19,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                identity == null
+                    ? 'Cấp quyền cho ${_waitingIdentities.length} người đang chờ.'
+                    : 'Chọn quyền cho $participantName.',
+                style: const TextStyle(color: Colors.white60, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              _ApprovalPermissionTile(
+                icon: Icons.mic_rounded,
+                title: 'Micro',
+                subtitle: 'Cho phép bật tiếng và phát biểu',
+                selected: state.allowMic,
+                onChanged: (value) =>
+                    dialogState.value = state.copyWith(allowMic: value),
+              ),
+              const SizedBox(height: 10),
+              _ApprovalPermissionTile(
+                icon: Icons.screen_share_rounded,
+                title: 'Chia sẻ màn hình',
+                subtitle: 'Cho phép trình chiếu nội dung',
+                selected: state.allowScreenShare,
+                onChanged: (value) =>
+                    dialogState.value = state.copyWith(allowScreenShare: value),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              style: TextButton.styleFrom(foregroundColor: Colors.white70),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Hủy'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF168BE7),
+                foregroundColor: Colors.white,
+                minimumSize: const Size(104, 44),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: !state.allowMic && !state.allowScreenShare
+                  ? null
+                  : () => Navigator.pop(
+                      dialogContext,
+                      _ApprovalChoice(
+                        allowMic: state.allowMic,
+                        allowScreenShare: state.allowScreenShare,
+                      ),
+                    ),
+              child: const Text('Đồng ý'),
+            ),
+          ],
+        ),
+      ),
+    );
+    dialogState.dispose();
+    if (choice == null) return;
+    if (identity == null) {
+      await _approveAll(
+        allowMic: choice.allowMic,
+        allowScreenShare: choice.allowScreenShare,
+      );
+    } else {
+      await _approve(
+        identity,
+        allowMic: choice.allowMic,
+        allowScreenShare: choice.allowScreenShare,
+      );
+    }
+  }
+
+  Future<void> _approveAll({
+    required bool allowMic,
+    required bool allowScreenShare,
+  }) async {
+    if (!_isHost || _room == null || _waitingIdentities.isEmpty) return;
+    final pending = List<String>.of(_waitingIdentities);
+    for (final identity in pending) {
+      await _send({
+        'type': 'hand_approved',
+        'allow_mic': allowMic,
+        'allow_screen_share': allowScreenShare,
+      }, destination: identity);
+    }
+    if (mounted) {
+      _waitingIdentities.removeAll(pending);
+      _refreshMeeting();
+    }
+  }
+
+  Future<void> _reject(String identity) async {
+    if (!_isHost || _room == null) return;
+    await _send({'type': 'hand_rejected'}, destination: identity);
+    _waitingIdentities.remove(identity);
+    _refreshMeeting();
+  }
+
+  Future<void> _toggleMic() async {
+    if (!_micEnabled && !_canUseMicrophone) {
+      _showMediaError('Bạn cần giơ tay và chờ chủ phòng duyệt quyền bật mic.');
+      return;
+    }
+    await _changeMedia(MeetingMedia.microphone, !_micEnabled);
+  }
+
+  Future<void> _toggleCamera() async {
+    await _changeMedia(MeetingMedia.camera, !_cameraEnabled);
+  }
+
+  LocalVideoTrack? get _localCameraTrack {
+    final track = _room?.localParticipant
+        ?.getTrackPublicationBySource(TrackSource.camera)
+        ?.track;
+    return track is LocalVideoTrack ? track : null;
+  }
+
+  Future<void> _switchCamera() async {
+    if (!_cameraEnabled || _changingCamera || _changingMic) return;
+    final track = _localCameraTrack;
+    if (track == null) {
+      _showMediaError('Chưa có luồng camera để đổi. Hãy bật camera trước.');
+      return;
+    }
+    final room = _room;
+    _changingCamera = true;
+    _refreshMeeting();
+    try {
+      final nextPosition = _cameraPosition.switched();
+      await track.setCameraPosition(nextPosition);
+      if (mounted && _room == room) {
+        _cameraPosition = nextPosition;
+        _refreshMeeting();
+      }
+    } catch (error) {
+      if (mounted && _room == room) {
+        _reportMediaFailure(MeetingMedia.camera, error);
+      }
+    } finally {
+      if (mounted && _room == room) {
+        _changingCamera = false;
+        _refreshMeeting();
+      }
+    }
+  }
+
+  Future<void> _changeMedia(MeetingMedia media, bool enabled) async {
+    final room = _room;
+    final local = room?.localParticipant;
+    if (local == null || _changingMic || _changingCamera) return;
+    final microphone = media == MeetingMedia.microphone;
+    final label = microphone ? 'micro' : 'camera';
+    _changingMic = microphone;
+    _changingCamera = !microphone;
+    _refreshMeeting();
+    try {
+      if (enabled) {
+        if (microphone && !_canUseMicrophone) return;
+        final access = await _mediaAccess.request(media);
+        if (!mounted || _room != room) return;
+        if (access != MediaAccessResult.granted) {
+          await _showPermissionHelp(media, access);
+          return;
+        }
+        // The host may revoke approval while the OS permission prompt is open.
+        if (microphone && !_canUseMicrophone) return;
+
+        final canPublishSource =
+            !microphone ||
+            local.permissions.canPublishSources.isEmpty ||
+            local.permissions.canPublishSources.any(
+              (source) => source.name == 'MICROPHONE',
+            );
+        if (!local.permissions.canPublish || !canPublishSource) {
+          _showMediaError(
+            microphone
+                ? 'Token LiveKit chưa cấp quyền phát micro. BE cần cấp canPublish=true và cho phép nguồn MICROPHONE.'
+                : 'Phòng chưa cấp quyền phát $label cho bạn. Hãy rời phòng và vào lại.',
+          );
+          return;
+        }
+      }
+      if (!mounted || _room != room) return;
+      if (microphone) {
+        await local.setMicrophoneEnabled(enabled);
+      } else {
+        if (enabled) {
+          // LiveKit keeps a muted camera publication and restarts it with its
+          // previous options. Reset that track's real capture options before
+          // unmuting so a camera switched to the back camera reopens on front.
+          final cameraTrack = _localCameraTrack;
+          final options = cameraTrack?.currentOptions;
+          if (cameraTrack != null && options is CameraCaptureOptions) {
+            cameraTrack.currentOptions = options.copyWith(
+              cameraPosition: CameraPosition.front,
+            );
+          }
+        }
+        await local.setCameraEnabled(enabled);
+        _cameraPosition = CameraPosition.front;
+      }
+      if (microphone && enabled && !_canUseMicrophone) {
+        await local.setMicrophoneEnabled(false);
+      }
+    } catch (error) {
+      if (mounted && _room == room) {
+        _reportMediaFailure(media, error);
+      }
+    } finally {
+      if (mounted && _room == room) {
+        _changingMic = false;
+        _changingCamera = false;
+        _refreshMeeting();
+      }
+    }
+  }
+
+  Future<void> _showPermissionHelp(
+    MeetingMedia media,
+    MediaAccessResult result,
+  ) async {
+    final label = media == MeetingMedia.microphone ? 'micro' : 'camera';
+    if (result == MediaAccessResult.simulatorCamera) {
+      _showMediaError(
+        'iPhone Simulator không có camera để phát hình. Hãy dùng iPhone thật; bạn vẫn xem được hình của người khác.',
+      );
+      return;
+    }
+    if (result == MediaAccessResult.restricted) {
+      _showMediaError(
+        'Quyền $label bị giới hạn trên thiết bị. Hãy kiểm tra giới hạn quyền trong Cài đặt.',
+      );
+      return;
+    }
+    final openSettings = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Cần quyền truy cập $label'),
+        content: Text(
+          media == MeetingMedia.microphone
+              ? 'HiSale chưa được cấp quyền dùng micro. Nếu không thấy HiSale trong Cài đặt > Micro, hãy vào Cài đặt > Quyền riêng tư & Bảo mật > Micro để kiểm tra, bật quyền cho HiSale rồi quay lại thử lại.'
+              : 'Bạn chưa cho phép ứng dụng dùng camera. Mở Cài đặt của ứng dụng và bật quyền này, sau đó quay lại thử lại.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Để sau'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Mở Cài đặt'),
+          ),
+        ],
+      ),
+    );
+    if (openSettings == true) await openAppSettings();
+  }
+
+  void _reportMediaFailure(MeetingMedia media, Object error) {
+    final label = media == MeetingMedia.microphone ? 'micro' : 'camera';
+    final details = _errorMessage(error);
+    final lower = details.toLowerCase();
+    if (kDebugMode) debugPrint('[hisale live] $label: $details');
+    if (lower.contains('notallowed') || lower.contains('permission')) {
+      _showMediaError(
+        'Thiết bị chưa cho phép truy cập $label. Kiểm tra quyền của ứng dụng trong Cài đặt rồi thử lại.',
+      );
+    } else if (lower.contains('notfound') || lower.contains('no device')) {
+      _showMediaError(
+        'Không tìm thấy thiết bị $label. Hãy kiểm tra thiết bị hoặc thử trên điện thoại thật.',
+      );
+    } else if (error is AudioSessionException) {
+      _showMediaError(
+        'Chưa khởi tạo được âm thanh. Hãy đóng ứng dụng đang dùng micro rồi thử lại.',
+      );
+    } else if (error is TrackPublishException || error is ConnectException) {
+      _showMediaError(
+        'Chưa gửi được $label lên phòng. Kiểm tra kết nối mạng rồi thử lại.',
+      );
+    } else {
+      _showMediaError(
+        'Chưa bật/tắt được $label. Hãy thử lại hoặc rời phòng rồi vào lại.',
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<Room?>(
+      valueListenable: _roomNotifier,
+      builder: (context, room, _) => Scaffold(
+        backgroundColor: room == null
+            ? (_isBackendAutoConnect
+                  ? const Color(0xFF101114)
+                  : const Color(0xFFF0F7FF))
+            : const Color(0xFF101114),
+        appBar: room == null
+            ? (_isBackendAutoConnect
+                  ? PreferredSize(
+                      preferredSize: const Size.fromHeight(kToolbarHeight),
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: _preJoinRevision,
+                        builder: (context, _, _) => _buildConnectingAppBar(),
+                      ),
+                    )
+                  : null)
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(kToolbarHeight),
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _meetingRevision,
+                  builder: (context, _, _) => _buildMeetingAppBar(),
+                ),
+              ),
+        body: SafeArea(
+          child: room == null
+              ? ValueListenableBuilder<int>(
+                  valueListenable: _preJoinRevision,
+                  builder: (context, _, _) => _isBackendAutoConnect
+                      ? _buildBackendConnectState()
+                      : _buildPreJoin(),
+                )
+              : ValueListenableBuilder<int>(
+                  valueListenable: _meetingRevision,
+                  builder: (context, _, _) => _buildMeeting(room),
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBackendConnectState() {
+    final connecting = _connecting || _error == null;
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF17181C), Color(0xFF101114)],
+        ),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 420),
+            padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1D1F24),
+              borderRadius: BorderRadius.circular(24),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 76,
+                  height: 76,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF168BE7).withValues(alpha: 0.14),
+                  ),
+                  child: Center(
+                    child: connecting
+                        ? const SizedBox(
+                            width: 30,
+                            height: 30,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2.5,
+                              color: Color(0xFF55B7FF),
+                            ),
+                          )
+                        : const Icon(
+                            Icons.cloud_off_rounded,
+                            size: 34,
+                            color: Color(0xFFFF8A80),
+                          ),
+                  ),
+                ),
+                const SizedBox(height: 22),
+                Text(
+                  connecting
+                      ? 'Đang kết nối phòng meeting'
+                      : 'Chưa thể vào phòng',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  connecting
+                      ? 'Đang xác thực và thiết lập kết nối an toàn. Vui lòng chờ trong giây lát.'
+                      : (_error ?? 'Đã có lỗi xảy ra. Vui lòng thử lại.'),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Color(0xFFAAADB5),
+                    height: 1.45,
+                    fontSize: 14,
+                  ),
+                ),
+                if (!connecting) ...[
+                  const SizedBox(height: 22),
+                  FilledButton.icon(
+                    onPressed: _connecting ? null : _connect,
+                    icon: const Icon(Icons.refresh_rounded),
+                    label: const Text('Thử kết nối lại'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF168BE7),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 13,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  AppBar _buildConnectingAppBar() {
+    final status = _error != null && !_connecting
+        ? 'Không kết nối được'
+        : 'Đang kết nối...';
+    return AppBar(
+      backgroundColor: const Color(0xFF17181C),
+      foregroundColor: Colors.white,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      titleSpacing: 16,
+      title: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            widget.initialRoomTitle?.trim().isNotEmpty == true
+                ? widget.initialRoomTitle!.trim()
+                : (widget.initialRoomName ?? 'Meeting'),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+          ),
+          Text(
+            status,
+            style: const TextStyle(
+              color: Color(0xFFAAADB5),
+              fontSize: 11,
+              fontWeight: FontWeight.w400,
+            ),
+          ),
+        ],
+      ),
+      actions: _appBarActions(),
+    );
+  }
+
+  List<Widget> _appBarActions() => [
+    if (widget.appBarAction != null) ...[
+      Center(child: widget.appBarAction!),
+      const SizedBox(width: 12),
+    ],
+  ];
+
+  AppBar _buildMeetingAppBar() => AppBar(
+    backgroundColor: const Color(0xFF17181C),
+    foregroundColor: Colors.white,
+    centerTitle: false,
+    iconTheme: const IconThemeData(color: Colors.white),
+    title: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'Tên phòng: $_connectedRoomName',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+        ),
+        Text(
+          '${_participants.length} người tham gia',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            color: Colors.white70,
+            fontSize: 11,
+            fontWeight: FontWeight.w400,
+          ),
+        ),
+      ],
+    ),
+    actions: [
+      if (_cameraEnabled)
+        Padding(
+          padding: const EdgeInsets.only(right: 6),
+          child: TextButton.icon(
+            onPressed: _changingCamera || _changingMic ? null : _switchCamera,
+            icon: const Icon(Icons.flip_camera_ios, size: 19),
+            label: Text(
+              _cameraPosition == CameraPosition.front ? 'Cam sau' : 'Cam trước',
+            ),
+            style: TextButton.styleFrom(
+              foregroundColor: Colors.white,
+              disabledForegroundColor: Colors.white38,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              textStyle: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      ..._appBarActions(),
+    ],
+  );
+
+  Widget _buildPreJoin() {
+    const blue = Color(0xFF168BE7);
+    const ink = Color(0xFF173858);
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFFE2F2FF), Color(0xFFF6FAFF)],
+        ),
+      ),
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: Container(
+                    width: 76,
+                    height: 76,
+                    decoration: BoxDecoration(
+                      color: blue,
+                      borderRadius: BorderRadius.circular(24),
+                      boxShadow: [
+                        BoxShadow(
+                          color: blue.withValues(alpha: 0.22),
+                          blurRadius: 28,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.video_camera_front_rounded,
+                      color: Colors.white,
+                      size: 38,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Text(
+                  'hisale live',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: blue,
+                    fontSize: 30,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.6,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Kết nối và học tập cùng nhau',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Color(0xFF68859E), fontSize: 15),
+                ),
+                const SizedBox(height: 28),
+                Container(
+                  padding: const EdgeInsets.all(22),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(color: const Color(0xFFDCEBFA)),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Color(0x0C176FA6),
+                        blurRadius: 28,
+                        offset: Offset(0, 10),
+                      ),
+                    ],
+                  ),
+                  child: Form(
+                    key: _joinFormKey,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Tham gia phòng học',
+                          style: TextStyle(
+                            color: ink,
+                            fontSize: 21,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        const Text(
+                          'Mọi người nhập cùng tên phòng để gặp nhau.',
+                          style: TextStyle(
+                            color: Color(0xFF68859E),
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 24),
+                        _joinField(
+                          controller: _roomController,
+                          label: 'Tên phòng',
+                          hint: 'Ví dụ: dao-tao-ban-hang',
+                          icon: Icons.meeting_room_outlined,
+                          missingMessage: 'Vui lòng nhập tên phòng.',
+                          action: TextInputAction.next,
+                        ),
+                        const SizedBox(height: 18),
+                        _joinField(
+                          controller: _nameController,
+                          label: 'Tên của bạn',
+                          hint: 'Nhập tên hiển thị',
+                          icon: Icons.person_outline_rounded,
+                          missingMessage: 'Vui lòng nhập tên của bạn.',
+                          action: TextInputAction.done,
+                        ),
+                        const SizedBox(height: 18),
+                        const Text(
+                          'Vai trò',
+                          style: TextStyle(
+                            color: ink,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        DropdownButtonFormField<_DemoRole>(
+                          initialValue: _role,
+                          isExpanded: true,
+                          dropdownColor: Colors.white,
+                          style: const TextStyle(color: ink, fontSize: 15),
+                          icon: const Icon(
+                            Icons.keyboard_arrow_down_rounded,
+                            color: blue,
+                          ),
+                          decoration: _joinDecoration(
+                            'Chọn vai trò',
+                            Icons.badge_outlined,
+                          ),
+                          items: const [
+                            DropdownMenuItem(
+                              value: _DemoRole.audience,
+                              child: Text('Thành viên'),
+                            ),
+                            DropdownMenuItem(
+                              value: _DemoRole.host,
+                              child: Text('Chủ phòng'),
+                            ),
+                          ],
+                          onChanged: _connecting
+                              ? null
+                              : (value) {
+                                  _role = value ?? _DemoRole.audience;
+                                  _refreshPreJoin();
+                                },
+                        ),
+                        if (_error != null) ...[
+                          const SizedBox(height: 16),
+                          Text(
+                            _error!,
+                            style: const TextStyle(
+                              color: Color(0xFFC33D4F),
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 24),
+                        SizedBox(
+                          height: 54,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: blue,
+                              foregroundColor: Colors.white,
+                              disabledBackgroundColor: const Color(0xFFB4DDF9),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                              textStyle: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                            onPressed: _connecting ? null : _connect,
+                            icon: _connecting
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Icon(Icons.login_rounded, size: 21),
+                            label: Text(
+                              _connecting ? 'Đang kết nối...' : 'Vào phòng',
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  'Mic và camera tắt khi vào phòng.\nBạn có thể bật khi sẵn sàng.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Color(0xFF68859E),
+                    fontSize: 12,
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  InputDecoration _joinDecoration(String hint, IconData icon) =>
+      InputDecoration(
+        hintText: hint,
+        hintStyle: const TextStyle(color: Color(0xFF91A6B9), fontSize: 14),
+        prefixIcon: Icon(icon, color: const Color(0xFF168BE7), size: 21),
+        filled: true,
+        fillColor: const Color(0xFFF5F9FE),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 16,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(13),
+          borderSide: const BorderSide(color: Color(0xFFDCE8F4)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(13),
+          borderSide: const BorderSide(color: Color(0xFFDCE8F4)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(13),
+          borderSide: const BorderSide(color: Color(0xFF168BE7), width: 1.5),
+        ),
+      );
+
+  Widget _joinField({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required IconData icon,
+    required String missingMessage,
+    required TextInputAction action,
+  }) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Text(
+        label,
+        style: const TextStyle(
+          color: Color(0xFF173858),
+          fontWeight: FontWeight.w600,
+          fontSize: 13,
+        ),
+      ),
+      const SizedBox(height: 8),
+      TextFormField(
+        controller: controller,
+        readOnly: _connecting,
+        autocorrect: false,
+        enableSuggestions: false,
+        textInputAction: action,
+        style: const TextStyle(color: Color(0xFF173858), fontSize: 15),
+        decoration: _joinDecoration(hint, icon),
+        validator: (value) =>
+            value == null || value.trim().isEmpty ? missingMessage : null,
+        onFieldSubmitted: (_) {
+          if (action == TextInputAction.done) _connect();
+        },
+      ),
+    ],
+  );
+
+  void _focusParticipant(Participant participant) {
+    _focusedScreen = false;
+    _focusedIdentity = participant.identity;
+    _fullScreen = true;
+    _refreshMeeting();
+  }
+
+  void _onScreenPublished(Participant participant, TrackSource source) {
+    if (!mounted || _room == null || source != TrackSource.screenShareVideo) {
+      return;
+    }
+    _focusedIdentity = participant.identity;
+    _focusedScreen = true;
+    _fullScreen = false;
+    _refreshMeeting();
+  }
+
+  void _exitFullScreen() {
+    _focusedIdentity = null;
+    _focusedScreen = false;
+    _fullScreen = false;
+    _refreshMeeting();
+  }
+
+  Widget _buildMeeting(Room room) {
+    final keyboardVisible = MediaQuery.viewInsetsOf(context).bottom > 0;
+    final chat = _chat;
+    final participants = _participants;
+    if (participants.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    final focused = participants
+        .where((p) => p.identity == _focusedIdentity)
+        .firstOrNull;
+    final host = _hostParticipant;
+    final sharing = participants.where((p) => p.isScreenShareEnabled()).toList()
+      ..sort((a, b) => a.identity.compareTo(b.identity));
+    final center = focused ?? sharing.firstOrNull ?? host ?? participants.first;
+    final hostIdentity = host?.identity;
+    final showingScreen = focused != null ? _focusedScreen : sharing.isNotEmpty;
+    final others = participants
+        .where((p) => showingScreen || p.identity != center.identity)
+        .toList();
+    return Column(
+      children: [
+        if (_hostNotice != null && !keyboardVisible)
+          Container(
+            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            padding: const EdgeInsets.only(left: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF263952),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.info_outline,
+                  color: Color(0xFF84C9FF),
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _hostNotice!,
+                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Đóng thông báo',
+                  onPressed: () {
+                    _hostNotice = null;
+                    _refreshMeeting();
+                  },
+                  icon: const Icon(
+                    Icons.close,
+                    color: Colors.white70,
+                    size: 18,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final isLandscape = constraints.maxWidth > constraints.maxHeight;
+              final sidebarWidth = (constraints.maxWidth * 0.28)
+                  .clamp(170.0, 240.0)
+                  .toDouble();
+              final availableHeight = (constraints.maxHeight - 24).clamp(
+                0.0,
+                double.infinity,
+              );
+              final chatHeight = keyboardVisible
+                  ? availableHeight
+                  : (availableHeight * (isLandscape ? 0.72 : 0.62))
+                        .clamp(
+                          isLandscape ? 120.0 : 160.0,
+                          isLandscape ? 240.0 : 330.0,
+                        )
+                        .clamp(0.0, availableHeight);
+              final chatRight =
+                  isLandscape &&
+                      !_fullScreen &&
+                      !keyboardVisible &&
+                      others.isNotEmpty
+                  ? sidebarWidth + 18
+                  : 12.0;
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (isLandscape)
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: showingScreen
+                                ? _screenShareTile(center)
+                                : _participantTile(
+                                    center,
+                                    large: true,
+                                    hostIdentity: hostIdentity,
+                                    onTap: _fullScreen
+                                        ? _exitFullScreen
+                                        : () => _focusParticipant(center),
+                                  ),
+                          ),
+                        ),
+                        if (!_fullScreen &&
+                            !keyboardVisible &&
+                            others.isNotEmpty)
+                          SizedBox(
+                            width: sidebarWidth,
+                            child: Container(
+                              margin: const EdgeInsets.fromLTRB(0, 12, 12, 12),
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF17181C),
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(
+                                  color: const Color(0xFF2B2D34),
+                                ),
+                              ),
+                              child: ListView.separated(
+                                padding: EdgeInsets.zero,
+                                itemCount: others.length,
+                                separatorBuilder: (_, index) =>
+                                    const SizedBox(height: 8),
+                                itemBuilder: (_, index) => SizedBox(
+                                  height: 96,
+                                  child: _participantTile(
+                                    others[index],
+                                    hostIdentity: hostIdentity,
+                                    onTap: () =>
+                                        _focusParticipant(others[index]),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    )
+                  else
+                    Column(
+                      children: [
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.all(12),
+                            child: showingScreen
+                                ? _screenShareTile(center)
+                                : _participantTile(
+                                    center,
+                                    large: true,
+                                    hostIdentity: hostIdentity,
+                                    onTap: _fullScreen
+                                        ? _exitFullScreen
+                                        : () => _focusParticipant(center),
+                                  ),
+                          ),
+                        ),
+                        if (!_fullScreen &&
+                            !keyboardVisible &&
+                            others.isNotEmpty &&
+                            constraints.maxHeight >= 280)
+                          SizedBox(
+                            height: 112,
+                            child: ListView.separated(
+                              scrollDirection: Axis.horizontal,
+                              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                              itemCount: others.length,
+                              separatorBuilder: (_, index) =>
+                                  const SizedBox(width: 8),
+                              itemBuilder: (_, index) => SizedBox(
+                                width: 142,
+                                child: _participantTile(
+                                  others[index],
+                                  hostIdentity: hostIdentity,
+                                  onTap: () => _focusParticipant(others[index]),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  if (chat != null && chat.visible && chatHeight > 0)
+                    Positioned(
+                      left: 12,
+                      right: chatRight,
+                      bottom: 12,
+                      child: Align(
+                        alignment: Alignment.bottomLeft,
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 380),
+                          child: SizedBox(
+                            height: chatHeight,
+                            width: double.infinity,
+                            child: LiveChatOverlay(controller: chat),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+        if (_isHost && _waitingIdentities.isNotEmpty && !keyboardVisible)
+          _waitingBanner(),
+        _controlBar(),
+      ],
+    );
+  }
+
+  VideoTrack? _videoTrack(Participant participant) {
+    final publication = participant.getTrackPublicationBySource(
+      TrackSource.camera,
+    );
+    if (publication == null || publication.muted) return null;
+    final track = publication.track;
+    return track is VideoTrack ? track : null;
+  }
+
+  Widget _screenShareTile(Participant participant) => ListenableBuilder(
+    listenable: participant,
+    builder: (context, _) {
+      final publication = participant.getTrackPublicationBySource(
+        TrackSource.screenShareVideo,
+      );
+      final track = publication?.track;
+      final local = participant.identity == _room?.localParticipant?.identity;
+      final name = _participantDisplayName(participant);
+      return Container(
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: Colors.black,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        foregroundDecoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF393C47)),
+        ),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (local)
+              const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Text(
+                    'Bạn đang chia sẻ màn hình.\nMở tài liệu hoặc ứng dụng cần trình bày.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.white70),
+                  ),
+                ),
+              )
+            else if (track is VideoTrack && publication?.muted == false)
+              IgnorePointer(
+                child: RepaintBoundary(
+                  child: VideoTrackRenderer(
+                    track,
+                    key: ValueKey('screen-share-${participant.identity}'),
+                    fit: VideoViewFit.contain,
+                    // The nested RTCVideoPlatFormView owns and disposes its
+                    // platform controller; disposing it here as well races
+                    // the child's dispose and throws ChangeNotifier errors.
+                    autoDisposeRenderer: false,
+                    // iOS texture renderers in flutter_webrtc 1.6.x can
+                    // dispatch a final frame after disposal. Native platform
+                    // views avoid that callback race on real devices.
+                    renderMode: VideoRenderMode.platformView,
+                  ),
+                ),
+              )
+            else
+              const Center(
+                child: Text(
+                  'Đang tải màn hình chia sẻ…',
+                  style: TextStyle(color: Colors.white70),
+                ),
+              ),
+            Positioned(
+              top: 8,
+              left: 12,
+              right: 4,
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.screen_share,
+                    color: Color(0xFF80CFFF),
+                    size: 18,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '$name đang chia sẻ',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        backgroundColor: Colors.black54,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: _fullScreen
+                        ? 'Thu nhỏ màn hình chia sẻ'
+                        : 'Phóng to màn hình chia sẻ',
+                    icon: Icon(
+                      _fullScreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                      color: Colors.white,
+                    ),
+                    onPressed: () {
+                      _fullScreen = !_fullScreen;
+                      _focusedIdentity = _fullScreen
+                          ? participant.identity
+                          : null;
+                      _focusedScreen = _fullScreen;
+                      _refreshMeeting();
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+
+  Future<void> _toggleScreenShare() async {
+    final share = _screenShare;
+    if (share == null) return;
+    if (!share.active && !_canShareScreen) {
+      _showMediaError(
+        'Bạn cần giơ tay và chờ chủ phòng duyệt quyền chia sẻ màn hình.',
+      );
+      return;
+    }
+
+    await share.toggle();
+    if (mounted && _screenShare == share && share.active && _cameraEnabled) {
+      await _disableCameraForScreenShare();
+    }
+    if (mounted && _screenShare == share && share.error != null) {
+      _showMediaError(share.error!);
+    }
+  }
+
+  void _showMoreActions() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF24262D),
+      builder: (sheetContext) {
+        final sharedParticipants = _participants
+            .where((p) => p.isScreenShareEnabled())
+            .toList();
+        return SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            children: [
+              const ListTile(
+                leading: Icon(Icons.tune_rounded, color: Color(0xFF80CFFF)),
+                title: Text(
+                  'Chức năng phụ',
+                  style: TextStyle(color: Colors.white),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(
+                  Icons.people_alt_outlined,
+                  color: Colors.white70,
+                ),
+                title: const Text(
+                  'Thành viên',
+                  style: TextStyle(color: Colors.white),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  _showParticipantsSheet();
+                },
+              ),
+              if (sharedParticipants.isNotEmpty) ...[
+                const Divider(color: Colors.white12, height: 1),
+                const ListTile(
+                  leading: Icon(Icons.present_to_all, color: Color(0xFF80CFFF)),
+                  title: Text(
+                    'Màn hình đang chia sẻ',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  subtitle: Text(
+                    'Chọn một người để xem toàn màn hình',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ),
+                for (final p in sharedParticipants)
+                  ListTile(
+                    leading: const Icon(
+                      Icons.present_to_all,
+                      color: Colors.white70,
+                    ),
+                    title: Text(
+                      'Xem màn hình: ${_participantDisplayName(p)}',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      _focusedIdentity = p.identity;
+                      _focusedScreen = true;
+                      _fullScreen = true;
+                      _refreshMeeting();
+                    },
+                  ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _participantTile(
+    Participant participant, {
+    bool large = false,
+    String? hostIdentity,
+    required VoidCallback onTap,
+  }) {
+    return ListenableBuilder(
+      listenable: participant,
+      builder: (context, _) {
+        final isLocal =
+            participant.identity == _room?.localParticipant?.identity;
+        final isHost = participant.identity == hostIdentity;
+        final name = _participantDisplayName(participant);
+        final initials = name.trim().isEmpty
+            ? '?'
+            : name.trim().characters.first.toUpperCase();
+        final micEnabled = participant.isMicrophoneEnabled();
+        final cameraEnabled = participant.isCameraEnabled();
+        final videoTrack = cameraEnabled ? _videoTrack(participant) : null;
+        final actionLabel = large && _fullScreen
+            ? 'Thu nhỏ'
+            : 'Xem toàn màn hình';
+        return Semantics(
+          button: true,
+          label:
+              '$name${isHost ? ', Chủ phòng' : ''}, mic ${micEnabled ? 'bật' : 'tắt'}, camera ${cameraEnabled ? 'bật' : 'tắt'}. $actionLabel',
+          child: GestureDetector(
+            onTap: onTap,
+            child: Container(
+              clipBehavior: Clip.antiAlias,
+              decoration: BoxDecoration(
+                // Keep portrait camera feeds fully visible in landscape. The
+                // unused sides become the dark letterbox used by Zoom.
+                color: const Color(0xFF080A0F),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              // Paint the border above the video and bottom gradient so its
+              // rounded lower corners remain visible.
+              foregroundDecoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: isHost
+                      ? const Color(0xFF60BFFF)
+                      : const Color(0xFF393C47),
+                  width: isHost ? 2 : 1,
+                ),
+              ),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (videoTrack != null)
+                    IgnorePointer(
+                      child: RepaintBoundary(
+                        child: VideoTrackRenderer(
+                          videoTrack,
+                          key: ValueKey('camera-${participant.identity}'),
+                          // Keep the complete camera frame. In landscape a
+                          // portrait source gets dark bars on the sides
+                          // instead of being cropped or stretched.
+                          fit: VideoViewFit.contain,
+                          mirrorMode: isLocal
+                              ? VideoViewMirrorMode.auto
+                              : VideoViewMirrorMode.off,
+                          // The RTCVideoPlatFormView child owns this controller.
+                          autoDisposeRenderer: false,
+                          // Use the native iOS view to avoid a known texture
+                          // renderer teardown race during rotation/rebuilds.
+                          renderMode: VideoRenderMode.platformView,
+                        ),
+                      ),
+                    )
+                  else
+                    Center(
+                      child: CircleAvatar(
+                        radius: large ? 48 : 24,
+                        backgroundColor: const Color(0xFF464A5A),
+                        child: Text(
+                          initials,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: large ? 38 : 22,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  const Positioned(
+                    left: 0,
+                    bottom: 0,
+                    right: 0,
+                    height: 72,
+                    child: IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [Colors.transparent, Color(0xBB000000)],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  if (isHost)
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xDD176FA6),
+                          borderRadius: BorderRadius.circular(7),
+                        ),
+                        child: const Text(
+                          'Chủ phòng',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: Icon(
+                      cameraEnabled ? Icons.videocam : Icons.videocam_off,
+                      color: cameraEnabled ? Colors.white : Colors.white60,
+                      size: 18,
+                    ),
+                  ),
+                  Positioned(
+                    left: 10,
+                    bottom: 10,
+                    right: 10,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            isLocal ? '$name (Bạn)' : name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: large ? 15 : 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(
+                          micEnabled ? Icons.mic : Icons.mic_off,
+                          color: micEnabled
+                              ? Colors.greenAccent
+                              : Colors.white60,
+                          size: 18,
+                        ),
+                        if (large) ...[
+                          const SizedBox(width: 8),
+                          Icon(
+                            _fullScreen
+                                ? Icons.fullscreen_exit
+                                : Icons.fullscreen,
+                            color: Colors.white70,
+                            size: 22,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _participantDisplayName(Participant participant) {
+    final isLocal = participant.identity == _room?.localParticipant?.identity;
+    final requestedName = widget.initialParticipantName?.trim() ?? '';
+    if (isLocal && requestedName.isNotEmpty) return requestedName;
+
+    final liveKitName = participant.name.trim();
+    return liveKitName.isNotEmpty ? liveKitName : participant.identity;
+  }
+
+  Widget _waitingBanner() => Container(
+    margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    decoration: BoxDecoration(
+      gradient: const LinearGradient(
+        colors: [Color(0xFF202E48), Color(0xFF25243D)],
+      ),
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: const Color(0xFF435A7A)),
+      boxShadow: const [
+        BoxShadow(
+          color: Color(0x30000000),
+          blurRadius: 12,
+          offset: Offset(0, 4),
+        ),
+      ],
+    ),
+    child: Row(
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: const Color(0xFF31517A),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: const Icon(
+            Icons.back_hand_rounded,
+            color: Color(0xFFFFD166),
+            size: 21,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${_waitingIdentities.length} yêu cầu phát biểu',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                'Thành viên đang chờ bạn duyệt',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: Color(0xFFB8C5D8), fontSize: 10),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 6),
+        Tooltip(
+          message: 'Cấp mic và quyền chia sẻ màn hình cho tất cả',
+          child: TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF9ACBFF),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            onPressed: _showApprovalDialog,
+            child: const Text(
+              'Duyệt tất cả',
+              maxLines: 1,
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ),
+        TextButton(
+          style: TextButton.styleFrom(
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            minimumSize: Size.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          onPressed: _showWaitingSheet,
+          child: const Text(
+            'Xem',
+            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _controlBar() {
+    final screenShareActive = _screenShare?.active ?? false;
+    final screenShareBusy = _screenShare?.busy ?? true;
+    final micWaiting = _handRaised && !_micEnabled;
+    final micLabel = _micEnabled
+        ? 'Tắt mic'
+        : micWaiting
+        ? 'Hủy xin'
+        : _canUseMicrophone
+        ? 'Bật mic'
+        : 'Xin mic';
+    final micIcon = _micEnabled
+        ? Icons.mic
+        : micWaiting
+        ? Icons.cancel_outlined
+        : _canUseMicrophone
+        ? Icons.mic_off
+        : Icons.mic_none_rounded;
+    final micAction = micWaiting ? _cancelHandRaise : _toggleMic;
+    final actions = <Widget>[
+      _controlButton(
+        micIcon,
+        micLabel,
+        micAction,
+        enabled: !_changingMic && !_changingCamera,
+        active: _micEnabled || _handRaised,
+      ),
+      _controlButton(
+        _cameraEnabled ? Icons.videocam : Icons.videocam_off,
+        _cameraEnabled ? 'Tắt cam' : 'Bật cam',
+        _toggleCamera,
+        enabled: !_changingCamera && !_changingMic,
+        active: _cameraEnabled,
+      ),
+      // Chat is a primary action and stays visible without horizontal scroll.
+      _controlButton(
+        (_chat?.visible ?? false)
+            ? Icons.chat_bubble_rounded
+            : Icons.chat_bubble_outline,
+        'Chat',
+        _toggleChat,
+        enabled: _chat != null,
+        active: _chat?.visible ?? false,
+        unreadCount: _chat?.unread ?? 0,
+      ),
+      _controlButton(
+        screenShareActive ? Icons.stop_screen_share : Icons.screen_share,
+        screenShareActive ? 'Dừng share' : 'Chia sẻ',
+        _toggleScreenShare,
+        // Let an unapproved member tap to see why sharing is unavailable.
+        enabled: _screenShare != null && !screenShareBusy,
+        active: screenShareActive,
+      ),
+      if (!_isHost && _needsHostApproval)
+        _controlButton(
+          _handRaised ? Icons.hourglass_top : Icons.back_hand,
+          _handRaised ? 'Đang chờ' : 'Giơ tay',
+          _handRaised ? _cancelHandRaise : _raiseHand,
+          enabled: !_changingMic && !_changingCamera,
+          active: _handRaised,
+        ),
+      _controlButton(
+        Icons.more_horiz,
+        'Thêm',
+        _showMoreActions,
+        enabled: _room != null,
+      ),
+      _controlButton(
+        Icons.exit_to_app_rounded,
+        'Thoát',
+        _exitApplication,
+        danger: true,
+      ),
+    ];
+    return Container(
+      padding: const EdgeInsets.fromLTRB(6, 6, 6, 8),
+      decoration: const BoxDecoration(color: Color(0xFF17181C)),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: actions,
+      ),
+    );
+  }
+
+  Widget _controlButton(
+    IconData icon,
+    String label,
+    VoidCallback action, {
+    bool expand = true,
+    bool enabled = true,
+    bool active = false,
+    bool danger = false,
+    int unreadCount = 0,
+  }) {
+    final button = Tooltip(
+      message: label,
+      child: InkWell(
+        onTap: enabled ? action : null,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 1),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                height: 36,
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Container(
+                    width: 36,
+                    height: 34,
+                    decoration: BoxDecoration(
+                      color: danger
+                          ? Colors.redAccent
+                          : (active
+                                ? const Color(0xFF176FA6)
+                                : const Color(0xFF2B2D34)),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Center(
+                      child: Badge(
+                        isLabelVisible: unreadCount > 0,
+                        backgroundColor: Colors.redAccent,
+                        textColor: Colors.white,
+                        largeSize: 16,
+                        offset: const Offset(4, -12),
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        textStyle: const TextStyle(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                        ),
+                        label: Text(unreadCount > 99 ? '99+' : '$unreadCount'),
+                        child: Icon(
+                          icon,
+                          color: enabled ? Colors.white : Colors.white24,
+                          size: 18,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: enabled ? Colors.white70 : Colors.white24,
+                  fontSize: 9,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    return expand
+        ? Expanded(child: button)
+        : SizedBox(width: 76, child: button);
+  }
+
+  void _showParticipantsSheet() => showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: const Color(0xFF24262D),
+    builder: (context) => SafeArea(
+      child: ListView(
+        shrinkWrap: true,
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text(
+            'Người tham gia',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 8),
+          ..._participants.map(
+            (participant) => ListTile(
+              leading: Icon(
+                participant.identity == _hostParticipant?.identity
+                    ? Icons.star_rounded
+                    : Icons.person,
+                color: Colors.white70,
+              ),
+              title: Text(
+                _participantDisplayName(participant),
+                style: const TextStyle(color: Colors.white),
+              ),
+              subtitle: Text(
+                participant.identity == _hostParticipant?.identity
+                    ? 'Chủ phòng'
+                    : 'Thành viên',
+                style: const TextStyle(color: Colors.white54),
+              ),
+              trailing: const Icon(Icons.fullscreen, color: Colors.white70),
+              onTap: () {
+                Navigator.pop(context);
+                _focusParticipant(participant);
+              },
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  void _showWaitingSheet() => showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: Colors.transparent,
+    builder: (sheetContext) => ValueListenableBuilder<int>(
+      valueListenable: _meetingRevision,
+      builder: (context, _, _) => Container(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.76,
+        ),
+        decoration: BoxDecoration(
+          color: const Color(0xFF20242C),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          border: Border.all(color: Colors.white12),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(height: 10),
+            Container(
+              width: 38,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white30,
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+              child: Row(
+                children: [
+                  Container(
+                    width: 46,
+                    height: 46,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(15),
+                    ),
+                    child: const Icon(
+                      Icons.front_hand_rounded,
+                      color: Color(0xFF70C7FF),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Yêu cầu phát biểu',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 19,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        SizedBox(height: 3),
+                        Text(
+                          'Duyệt quyền mic hoặc chia sẻ màn hình',
+                          style: TextStyle(color: Colors.white60, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 11,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF43B5FF).withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(
+                      '${_waitingIdentities.length}',
+                      style: const TextStyle(
+                        color: Color(0xFF70C7FF),
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1, color: Colors.white12),
+            if (_waitingIdentities.isEmpty)
+              const Padding(
+                padding: EdgeInsets.fromLTRB(24, 30, 24, 34),
+                child: Column(
+                  children: [
+                    Icon(
+                      Icons.hourglass_empty_rounded,
+                      color: Colors.white38,
+                      size: 30,
+                    ),
+                    SizedBox(height: 10),
+                    Text(
+                      'Không còn yêu cầu đang chờ.',
+                      style: TextStyle(color: Colors.white60),
+                    ),
+                  ],
+                ),
+              )
+            else
+              Flexible(
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
+                  itemCount: _waitingIdentities.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 10),
+                  itemBuilder: (context, index) => _waitingRequestTile(
+                    sheetContext,
+                    _waitingIdentities.elementAt(index),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    ),
+  );
+
+  Widget _waitingRequestTile(BuildContext sheetContext, String identity) {
+    final participant = _participants
+        .where((value) => value.identity == identity)
+        .firstOrNull;
+    final name = participant == null
+        ? 'Thành viên'
+        : _participantDisplayName(participant);
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF292E38),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            radius: 21,
+            backgroundColor: const Color(0xFF3A4656),
+            child: Text(
+              name.isEmpty ? '?' : name.characters.first.toUpperCase(),
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                const Text(
+                  'Đang chờ host duyệt',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          _RequestActionButton(
+            tooltip: 'Duyệt quyền',
+            color: const Color(0xFF35C98B),
+            icon: Icons.check_rounded,
+            onPressed: () {
+              Navigator.pop(sheetContext);
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) unawaited(_showApprovalDialog(identity));
+              });
+            },
+          ),
+          const SizedBox(width: 4),
+          _RequestActionButton(
+            tooltip: 'Từ chối',
+            color: const Color(0xFFFF657A),
+            icon: Icons.close_rounded,
+            onPressed: () {
+              Navigator.pop(sheetContext);
+              unawaited(_reject(identity));
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ApprovalPermissionTile extends StatelessWidget {
+  const _ApprovalPermissionTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final bool selected;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = selected ? const Color(0xFF43B5FF) : Colors.white38;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(17),
+        onTap: () => onChanged(!selected),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
+          decoration: BoxDecoration(
+            color: selected
+                ? const Color(0xFF168BE7).withValues(alpha: 0.13)
+                : const Color(0xFF292E38),
+            borderRadius: BorderRadius.circular(17),
+            border: Border.all(
+              color: selected
+                  ? const Color(0xFF43B5FF).withValues(alpha: 0.55)
+                  : Colors.white10,
+            ),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.13),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: accent, size: 20),
+              ),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Switch.adaptive(
+                value: selected,
+                activeTrackColor: const Color(0xFF168BE7),
+                onChanged: onChanged,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RequestActionButton extends StatelessWidget {
+  const _RequestActionButton({
+    required this.tooltip,
+    required this.color,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  final String tooltip;
+  final Color color;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: color.withValues(alpha: 0.14),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: onPressed,
+          child: SizedBox(
+            width: 40,
+            height: 40,
+            child: Icon(icon, color: color, size: 21),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ApprovalChoice {
+  const _ApprovalChoice({
+    required this.allowMic,
+    required this.allowScreenShare,
+  });
+
+  final bool allowMic;
+  final bool allowScreenShare;
+}
+
+class _ApprovalDialogState {
+  const _ApprovalDialogState({
+    this.allowMic = true,
+    this.allowScreenShare = true,
+  });
+
+  final bool allowMic;
+  final bool allowScreenShare;
+
+  _ApprovalDialogState copyWith({bool? allowMic, bool? allowScreenShare}) =>
+      _ApprovalDialogState(
+        allowMic: allowMic ?? this.allowMic,
+        allowScreenShare: allowScreenShare ?? this.allowScreenShare,
+      );
+}
+
+enum _DemoRole { host, audience }
