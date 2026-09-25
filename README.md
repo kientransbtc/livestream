@@ -1,4 +1,4 @@
-# hisale live — demo LiveKit
+# Hisale Coaching Hub — demo LiveKit
 
 Demo Flutter trong project `hi_zoom`.
 

@@ -1,4 +1,4 @@
-# Chia sẻ màn hình — hisale live
+# Chia sẻ màn hình — Hisale Coaching Hub
 
 ## Sử dụng
 

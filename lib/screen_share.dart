@@ -175,7 +175,7 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
     if (!await rtc.Helper.requestCapturePermission()) return false;
     final initialized = await FlutterBackground.initialize(
       androidConfig: const FlutterBackgroundAndroidConfig(
-        notificationTitle: 'hisale live',
+        notificationTitle: 'Hisale Coaching Hub',
         notificationText: 'Đang chia sẻ màn hình. Mở ứng dụng để dừng.',
         notificationImportance: AndroidNotificationImportance.normal,
         notificationIcon: AndroidResource(

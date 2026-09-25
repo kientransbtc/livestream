@@ -28,7 +28,7 @@ class LiveKitDemoApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'hisale live',
+      title: 'Hisale Coaching Hub',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF168BE7)),
@@ -594,7 +594,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           child: const Icon(Icons.logout_rounded, color: Color(0xFFFF7184)),
         ),
         title: const Text(
-          'Thoát hisale live?',
+          'Thoát Hisale Coaching Hub?',
           textAlign: TextAlign.center,
           style: TextStyle(
             color: Colors.white,
@@ -1165,7 +1165,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final label = media == MeetingMedia.microphone ? 'micro' : 'camera';
     final details = _errorMessage(error);
     final lower = details.toLowerCase();
-    if (kDebugMode) debugPrint('[hisale live] $label: $details');
+    if (kDebugMode) debugPrint('[Hisale Coaching Hub] $label: $details');
     if (lower.contains('notallowed') || lower.contains('permission')) {
       _showMediaError(
         'Thiết bị chưa cho phép truy cập $label. Kiểm tra quyền của ứng dụng trong Cài đặt rồi thử lại.',
@@ -1284,7 +1284,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                 const SizedBox(height: 22),
                 Text(
                   connecting
-                      ? 'Đang kết nối phòng meeting'
+                      ? 'Đang kết nối Hisale Coaching Hub'
                       : 'Chưa thể vào phòng',
                   textAlign: TextAlign.center,
                   style: const TextStyle(
@@ -1350,7 +1350,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           Text(
             widget.initialRoomTitle?.trim().isNotEmpty == true
                 ? widget.initialRoomTitle!.trim()
-                : (widget.initialRoomName ?? 'Meeting'),
+                : (widget.initialRoomName ?? 'Hisale Coaching Hub'),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
@@ -1471,7 +1471,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                 ),
                 const SizedBox(height: 18),
                 const Text(
-                  'hisale live',
+                  'Hisale Coaching Hub',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: blue,

@@ -50,7 +50,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 self.connectTimer?.cancel()
                 self.connectTimer = nil
             } else if Date() > deadline {
-                self.finish("Không kết nối được phòng. Mở hisale live và thử lại.")
+                self.finish("Không kết nối được phòng. Mở Hisale Coaching Hub và thử lại.")
             }
         }
         timer.resume()

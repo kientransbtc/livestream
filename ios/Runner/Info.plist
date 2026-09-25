@@ -9,7 +9,7 @@
     <string>$(DEVELOPMENT_LANGUAGE)</string>
 
     <key>CFBundleDisplayName</key>
-    <string>hisale live</string>
+	<string>Hisale Coaching Hub</string>
 
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
@@ -21,7 +21,7 @@
     <string>6.0</string>
 
     <key>CFBundleName</key>
-    <string>hisale live</string>
+	<string>Hisale Coaching Hub</string>
 
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -42,13 +42,13 @@
     <string>Dùng thiết bị Bluetooth khi tham gia lớp học.</string>
 
     <key>NSCalendarsUsageDescription</key>
-    <string>This permission may be required by meeting features.</string>
+    <string>This permission may be required by Hisale Coaching Hub.</string>
 
     <key>NSCameraUsageDescription</key>
     <string>Dùng camera để tham gia lớp học trực tuyến.</string>
 
     <key>NSContactsUsageDescription</key>
-    <string>This permission may be required by meeting features.</string>
+    <string>This permission may be required by Hisale Coaching Hub.</string>
 
     <key>NSMicrophoneUsageDescription</key>
     <string>Dùng micro để trao đổi trong lớp học.</string>
