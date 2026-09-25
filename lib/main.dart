@@ -2384,7 +2384,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
               ),
               const SizedBox(height: 2),
               const Text(
-                'Thành viên đang chờ bạn duyệt',
+                'Thành viên chờ duyệt',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: Color(0xFFB8C5D8), fontSize: 10),
