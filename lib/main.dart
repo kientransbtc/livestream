@@ -347,15 +347,32 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         roomOptions: const RoomOptions(
           adaptiveStream: true,
           dynacast: true,
+          // Voice processing runs before screen-share audio is mixed in, so it
+          // cleans the presenter's mic without filtering the shared media.
+          // The high-pass filter (off by default) removes rumble and hum.
+          defaultAudioCaptureOptions: AudioCaptureOptions(
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            highPassFilter: true,
+            voiceIsolation: true,
+          ),
           defaultCameraCaptureOptions: CameraCaptureOptions(
             cameraPosition: CameraPosition.front,
           ),
           defaultScreenShareCaptureOptions: ScreenShareCaptureOptions(
             useiOSBroadcastExtension: true,
-            maxFrameRate: 15,
-            // 720p keeps documents readable while reducing mobile encoding
-            // and uplink pressure compared with the 1080p default preset.
-            params: VideoParametersPresets.screenShareH720FPS15,
+            maxFrameRate: 30,
+            // Keep the 720p share light enough for mobile uplinks while
+            // allowing video playback to update at 30 fps instead of the
+            // previous 15 fps cap.
+            params: VideoParameters(
+              dimensions: VideoDimensionsPresets.h720_169,
+              encoding: VideoEncoding(
+                maxBitrate: 2_000_000,
+                maxFramerate: 30,
+              ),
+            ),
           ),
         ),
       );
@@ -2072,6 +2089,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     await share.toggle();
     if (mounted && _screenShare == share && share.active && _cameraEnabled) {
       await _disableCameraForScreenShare();
+    }
+    if (mounted && _screenShare == share && share.active && !_micEnabled) {
+      _showMediaError(
+        'Đang chia sẻ hình ảnh. Bật mic đã được duyệt để truyền cả tiếng video; '
+        'tắt mic sẽ tắt cả tiếng chia sẻ.',
+      );
     }
   }
 

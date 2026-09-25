@@ -7,8 +7,13 @@ let broadcastLogger = OSLog(subsystem: "com.example.hiZoom", category: "Broadcas
 
 final class SampleHandler: RPBroadcastSampleHandler {
     private var connection: SocketConnection?
+    private var audioConnection: SocketConnection?
     private var uploader: SampleUploader?
+    private var audioUploader: AudioSampleUploader?
     private var connectTimer: DispatchSourceTimer?
+    private var videoConnected = false
+    private var audioConnected = false
+    private var receivedAppAudio = false
     @Atomic private var finished = false
     private let stopNotification = "iOS_BroadcastRequestStop" as CFString
 
@@ -19,13 +24,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
             let container = FileManager.default.containerURL(
                 forSecurityApplicationGroupIdentifier: appGroupIdentifier
             ),
-            let socket = SocketConnection(filePath: container.appendingPathComponent("rtc_SSFD").path)
+            let socket = SocketConnection(filePath: container.appendingPathComponent("rtc_SSFD").path),
+            let audioSocket = SocketConnection(filePath: container.appendingPathComponent("rtc_SSFA").path)
         else {
             finish("Chưa cấu hình App Group cho chia sẻ màn hình.")
             return
         }
         connection = socket
+        audioConnection = audioSocket
         uploader = SampleUploader(connection: socket)
+        audioUploader = AudioSampleUploader(connection: audioSocket)
 
         socket.didClose = { [weak self] _ in
             DispatchQueue.main.async { self?.finish("Đã dừng chia sẻ màn hình.") }
@@ -43,13 +51,29 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         connectTimer = timer
         let deadline = Date().addingTimeInterval(15)
+        var audioAttempts = 0
         timer.schedule(deadline: .now(), repeating: .milliseconds(100))
         timer.setEventHandler { [weak self] in
             guard let self = self, !self.finished else { return }
-            if self.connection?.open() == true {
+            if !self.videoConnected && self.connection?.open() == true {
+                self.videoConnected = true
+                os_log(.default, log: broadcastLogger, "Screen video socket connected")
+            }
+            if !self.audioConnected {
+                audioAttempts += 1
+                if self.audioConnection?.open() == true {
+                    self.audioConnected = true
+                    os_log(.default, log: broadcastLogger, "Screen audio socket connected after %d attempts", audioAttempts)
+                } else if audioAttempts % 20 == 0 {
+                    os_log(.default, log: broadcastLogger, "Screen audio socket not connected yet (%d attempts)", audioAttempts)
+                }
+            }
+            if self.videoConnected && self.audioConnected {
                 self.connectTimer?.cancel()
                 self.connectTimer = nil
-            } else if Date() > deadline {
+            } else if !self.videoConnected && Date() > deadline {
+                // Only a missing video connection ends the broadcast. Audio keeps
+                // retrying; sharing the screen without sound beats no share.
                 self.finish("Không kết nối được phòng. Mở Hisale Coaching Hub và thử lại.")
             }
         }
@@ -61,6 +85,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
         switch type {
         case .video:
             uploader?.send(sample: buffer)
+        case .audioApp:
+            if !receivedAppAudio {
+                receivedAppAudio = true
+                os_log(.default, log: broadcastLogger, "ReplayKit app-audio callback started")
+            }
+            audioUploader?.send(sampleBuffer: buffer)
         default:
             break
         }
@@ -90,7 +120,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
         DarwinNotificationCenter.shared.postNotification(.broadcastStopped)
         connection?.didClose = nil
         connection?.close()
+        audioConnection?.didClose = nil
+        audioConnection?.close()
         uploader = nil
+        audioUploader = nil
         connection = nil
+        audioConnection = nil
     }
 }

@@ -1,3 +1,6 @@
+// AudioManager session APIs are marked experimental in livekit_client 2.13.
+// ignore_for_file: experimental_member_use
+
 import 'dart:async';
 
 import 'package:device_info_plus/device_info_plus.dart';
@@ -170,6 +173,7 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
   final Room room;
   bool _ownsService = false;
   bool _capturePrevented = false;
+  bool _ownsMixableAudioSession = false;
   bool get _ios => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
   bool get _android =>
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
@@ -255,8 +259,11 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
     }
     await room.localParticipant!.setScreenShareEnabled(
       true,
-      // Only publish the screen video track. Meeting microphone audio remains
-      // an independent LiveKit track and is unaffected by screen sharing.
+      // Device playback is mixed natively into the microphone track after
+      // voice processing. A second local audio track must not be published:
+      // this WebRTC build mutes the shared mic input (ADM) whenever any local
+      // audio stream is muted, which silences the presenter's voice too.
+      // LiveKit's captureScreenAudio path is for web, not ReplayKit.
       captureScreenAudio: false,
     );
 
@@ -265,6 +272,57 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
     if (_ios && !BroadcastManager().isBroadcasting) {
       await _waitForIOSBroadcast();
     }
+    if (_ios) await _enableMixableAudioSession();
+  }
+
+  /// LiveKit's automatic iOS session is playAndRecord without mixWithOthers.
+  /// While broadcasting, the presenter plays media in another app; that app's
+  /// non-mixable session then interrupts ours, which stops the WebRTC mic
+  /// capture that ReplayKit app audio is mixed into, so nobody hears it.
+  Future<void> _enableMixableAudioSession() async {
+    final manager = AudioManager.instance;
+    if (_ownsMixableAudioSession ||
+        manager.managementMode != AudioSessionManagementMode.automatic) {
+      return;
+    }
+    try {
+      await manager.setAudioSessionOptions(
+        AudioSessionOptions.communication(
+          apple: AppleAudioSessionConfiguration(
+            category: AppleAudioCategory.playAndRecord,
+            categoryOptions: const {
+              AppleAudioCategoryOption.allowBluetooth,
+              AppleAudioCategoryOption.allowBluetoothA2DP,
+              AppleAudioCategoryOption.allowAirPlay,
+              AppleAudioCategoryOption.mixWithOthers,
+            },
+            // Match the automatic policy so routing does not jump to the
+            // earpiece/speaker when the category options change.
+            mode: manager.isSpeakerOutputPreferred
+                ? AppleAudioMode.videoChat
+                : AppleAudioMode.voiceChat,
+          ),
+        ),
+      );
+      _ownsMixableAudioSession = true;
+    } catch (error) {
+      // Video sharing still works; only other-app audio may be interrupted.
+      debugPrint(
+        '[Hisale Coaching Hub] Could not enable mixable audio session: $error',
+      );
+      await manager.setAudioSessionManagementMode(
+        AudioSessionManagementMode.automatic,
+      );
+    }
+  }
+
+  Future<void> _restoreAudioSession() async {
+    if (!_ownsMixableAudioSession) return;
+    _ownsMixableAudioSession = false;
+    // Hands the session back to LiveKit, which reapplies its managed policy.
+    await AudioManager.instance.setAudioSessionManagementMode(
+      AudioSessionManagementMode.automatic,
+    );
   }
 
   Future<void> _waitForIOSBroadcast() async {
@@ -308,6 +366,7 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
         await FlutterBackground.disableBackgroundExecution();
         _ownsService = false;
       }
+      await _restoreAudioSession();
     }
   }
 
