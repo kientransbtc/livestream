@@ -16,6 +16,7 @@ abstract class ScreenShareBackend {
   Future<bool> prepare();
   Future<void> publish();
   Future<void> stop();
+  Future<void> restoreMicrophoneCapture();
   void preventNewCapture();
 }
 
@@ -25,8 +26,18 @@ class ScreenShareController extends ChangeNotifier {
   factory ScreenShareController.forRoom(Room room) {
     final controller = ScreenShareController(_LiveKitScreenShareBackend(room));
     final local = room.localParticipant!;
+    final observeBroadcast =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
     local.addListener(controller.refresh);
-    controller._detach = () => local.removeListener(controller.refresh);
+    if (observeBroadcast) {
+      BroadcastManager().addListener(controller.refresh);
+    }
+    controller._detach = () {
+      local.removeListener(controller.refresh);
+      if (observeBroadcast) {
+        BroadcastManager().removeListener(controller.refresh);
+      }
+    };
     return controller;
   }
 
@@ -36,11 +47,15 @@ class ScreenShareController extends ChangeNotifier {
   Future<void>? _closing;
   bool _closed = false;
   bool _disposed = false;
+  bool _captureWasStarted = false;
+  bool _sharingConfirmed = false;
   bool _wasActive = false;
   bool _busy = false;
   String? _error;
 
-  bool get active => backend.active;
+  // Some platforms create/enable a publication while the native consent UI is
+  // still open. Treat sharing as active only after the capture flow completes.
+  bool get active => _sharingConfirmed && backend.active;
   bool get busy => _busy;
   String? get error => _error;
 
@@ -77,24 +92,46 @@ class ScreenShareController extends ChangeNotifier {
   Future<void> _perform({required bool start}) async {
     try {
       if (start) {
+        _sharingConfirmed = false;
         final allowed = await backend.prepare();
         if (!allowed || _closed) {
           await backend.stop();
           return;
         }
         await backend.publish();
+        _captureWasStarted = true;
+        _sharingConfirmed = backend.capturing;
       } else {
+        _sharingConfirmed = false;
         await backend.stop();
+        final restoreMicrophone = _captureWasStarted;
+        _captureWasStarted = false;
+        if (restoreMicrophone) {
+          await backend.restoreMicrophoneCapture();
+        }
       }
     } catch (e) {
+      _sharingConfirmed = false;
+      if (start) {
+        // A native publisher can become active before publish() reports an
+        // error. Remember that capture so cleanup can also repair the mic.
+        _captureWasStarted = backend.active || backend.capturing;
+      }
       _error = e is ScreenShareException
           ? e.message
-          : 'Không thể chia sẻ màn hình. Kiểm tra kết nối và thử lại.';
+          : start
+          ? 'Không thể chia sẻ màn hình. Kiểm tra kết nối và thử lại.'
+          : 'Đã dừng chia sẻ nhưng chưa khôi phục được micro. Hãy thử lại mic.';
       try {
         await backend.stop();
-      } catch (_) {
-        _error =
-            'Chưa dừng được chia sẻ. Hãy bấm Dừng trên thông báo hệ thống.';
+        if (!start && _captureWasStarted) {
+          _captureWasStarted = false;
+          await backend.restoreMicrophoneCapture();
+        }
+      } catch (cleanupError) {
+        _error = cleanupError is ScreenShareException
+            ? cleanupError.message
+            : 'Chưa dừng được chia sẻ. Hãy bấm Dừng trên thông báo hệ thống.';
       }
     } finally {
       _busy = false;
@@ -138,7 +175,12 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
       !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   @override
-  bool get active => room.localParticipant?.isScreenShareEnabled() ?? false;
+  bool get active {
+    final published = room.localParticipant?.isScreenShareEnabled() ?? false;
+    // LiveKit may expose the publication while ReplayKit's system picker is
+    // still pending. It is not an active share until iOS confirms broadcast.
+    return published && (!_ios || BroadcastManager().isBroadcasting);
+  }
 
   @override
   bool get capturing => active || (_ios && BroadcastManager().isBroadcasting);
@@ -256,11 +298,101 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
         await BroadcastManager().requestStop();
       }
       await room.localParticipant?.setScreenShareEnabled(false);
+      if (_ios && !await _waitForIOSBroadcastToStop()) {
+        throw const ScreenShareException(
+          'Chưa xác nhận được iOS đã dừng chia sẻ màn hình.',
+        );
+      }
     } finally {
       if (_android && _ownsService) {
         await FlutterBackground.disableBackgroundExecution();
         _ownsService = false;
       }
     }
+  }
+
+  @override
+  Future<void> restoreMicrophoneCapture() async {
+    final local = room.localParticipant;
+    if (local == null ||
+        room.connectionState != ConnectionState.connected ||
+        !local.isMicrophoneEnabled()) {
+      return;
+    }
+
+    final publication = local.getTrackPublicationBySource(
+      TrackSource.microphone,
+    );
+    final track = publication?.track;
+    if (publication == null || publication.muted || track is! LocalAudioTrack) {
+      return;
+    }
+
+    // Let ReplayKit/MediaProjection and their audio services finish releasing
+    // the capture session before asking WebRTC to acquire the microphone again.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (room.connectionState != ConnectionState.connected ||
+        !local.isMicrophoneEnabled() ||
+        !_canPublishMicrophone(local) ||
+        publication.muted ||
+        publication.track != track) {
+      return;
+    }
+
+    try {
+      // The publication remains unmuted, but the native capture can be stale
+      // after screen capture/background transitions. Replace its source while
+      // keeping the same LiveKit publication and the user's mic state.
+      await track.restartTrack();
+      debugPrint(
+        '[Hisale Coaching Hub] Microphone capture restored after screen share.',
+      );
+    } catch (error) {
+      debugPrint(
+        '[Hisale Coaching Hub] Mic track restart failed; retrying through LiveKit mute/unmute: $error',
+      );
+
+      // Fallback to the same SDK mute/unmute cycle that recovers the mic when
+      // a user toggles the button manually. Only do this while the room and
+      // existing mic publication are still valid.
+      if (room.connectionState != ConnectionState.connected ||
+          !local.isMicrophoneEnabled() ||
+          publication.muted ||
+          publication.track != track ||
+          !_canPublishMicrophone(local)) {
+        return;
+      }
+      try {
+        await local.setMicrophoneEnabled(false);
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+        if (room.connectionState == ConnectionState.connected &&
+            !local.isMicrophoneEnabled() &&
+            _canPublishMicrophone(local)) {
+          await local.setMicrophoneEnabled(true);
+        }
+      } catch (retryError) {
+        throw ScreenShareException(
+          'Đã dừng chia sẻ nhưng chưa khôi phục được micro: $retryError',
+        );
+      }
+    }
+  }
+
+  bool _canPublishMicrophone(LocalParticipant local) {
+    final permissions = local.permissions;
+    return permissions.canPublish &&
+        (permissions.canPublishSources.isEmpty ||
+            permissions.canPublishSources.any(
+              (source) => source.name == 'MICROPHONE',
+            ));
+  }
+
+  Future<bool> _waitForIOSBroadcastToStop() async {
+    final manager = BroadcastManager();
+    for (var attempt = 0; attempt < 40; attempt++) {
+      if (!manager.isBroadcasting) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    return !manager.isBroadcasting;
   }
 }

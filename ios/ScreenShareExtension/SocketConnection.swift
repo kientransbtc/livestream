@@ -74,6 +74,12 @@ class SocketConnection: NSObject {
     func writeToStream(buffer: UnsafePointer<UInt8>, maxLength length: Int) -> Int {
         outputStream?.write(buffer, maxLength: length) ?? 0
     }
+
+    /// True once the write side is usable, even if `.openCompleted` was missed.
+    var isOutputOpen: Bool {
+        guard let status = outputStream?.streamStatus else { return false }
+        return status == .open || status == .writing
+    }
 }
 
 extension SocketConnection: StreamDelegate {
@@ -147,6 +153,10 @@ private extension SocketConnection {
 
         guard status == noErr else {
             os_log(.debug, log: broadcastLogger, "failure: \(status)")
+            // A failed connect() can leave the descriptor unusable, e.g. after
+            // hitting a stale socket file from a previous share. Retry fresh.
+            Darwin.close(socketHandle)
+            socketHandle = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
             return false
         }
 
@@ -173,10 +183,14 @@ private extension SocketConnection {
     func scheduleStreams() {
         shouldKeepRunning = true
 
+        // Streams must be on a run loop before open(); otherwise the
+        // .openCompleted event can be lost and the uploader never starts.
+        let scheduled = DispatchSemaphore(value: 0)
         networkQueue = DispatchQueue.global(qos: .userInitiated)
         networkQueue?.async { [weak self] in
             self?.inputStream?.schedule(in: .current, forMode: .common)
             self?.outputStream?.schedule(in: .current, forMode: .common)
+            scheduled.signal()
             RunLoop.current.run()
 
             var isRunning = false
@@ -185,6 +199,7 @@ private extension SocketConnection {
                 isRunning = self?.shouldKeepRunning ?? false && RunLoop.current.run(mode: .default, before: .distantFuture)
             } while (isRunning)
         }
+        _ = scheduled.wait(timeout: .now() + 1)
     }
 
     func unscheduleStreams() {

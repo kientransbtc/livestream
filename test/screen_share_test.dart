@@ -10,6 +10,7 @@ class FakeCapture extends ScreenShareBackend {
   bool service = false;
   bool failPublish = false;
   Completer<bool>? permission;
+  Completer<void>? publishGate;
 
   @override
   bool get active => published;
@@ -29,8 +30,9 @@ class FakeCapture extends ScreenShareBackend {
   @override
   Future<void> publish() async {
     calls.add('publish');
-    if (failPublish) throw StateError('network');
     published = true;
+    await publishGate?.future;
+    if (failPublish) throw StateError('cancelled');
   }
 
   @override
@@ -38,6 +40,11 @@ class FakeCapture extends ScreenShareBackend {
     calls.add('stop');
     published = false;
     service = false;
+  }
+
+  @override
+  Future<void> restoreMicrophoneCapture() async {
+    calls.add('restore_mic');
   }
 
   @override
@@ -67,11 +74,51 @@ void main() {
     expect(share.active, isTrue);
     await share.toggle();
     expect(native.service, isFalse);
+    expect(native.calls.skip(native.calls.length - 2), ['stop', 'restore_mic']);
     await share.toggle();
     expect(native.calls.where((v) => v == 'permission'), hasLength(2));
     await share.close();
     expect(native.service, isFalse);
   });
+
+  test('share stays inactive while native consent is pending', () async {
+    final native = FakeCapture()..publishGate = Completer<void>();
+    final share = ScreenShareController(native);
+    final start = share.toggle();
+    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(Duration.zero);
+
+    expect(native.published, isTrue);
+    expect(share.busy, isTrue);
+    expect(share.active, isFalse);
+
+    native.publishGate!.complete();
+    await start;
+    expect(share.active, isTrue);
+    await share.close();
+  });
+
+  test(
+    'cancelled native consent cleans up and leaves share inactive',
+    () async {
+      final native = FakeCapture()
+        ..publishGate = Completer<void>()
+        ..failPublish = true;
+      final share = ScreenShareController(native);
+      final start = share.toggle();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(share.active, isFalse);
+      native.publishGate!.complete();
+      await start;
+
+      expect(share.active, isFalse);
+      expect(share.busy, isFalse);
+      expect(native.published, isFalse);
+      await share.close();
+    },
+  );
 
   test(
     'leaving during consent prevents publication and cleans the service',
@@ -114,6 +161,7 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(native.service, isFalse);
     expect(share.active, isFalse);
+    expect(native.calls.skip(native.calls.length - 2), ['stop', 'restore_mic']);
     await share.close();
   });
 }

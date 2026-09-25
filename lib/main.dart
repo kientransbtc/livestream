@@ -95,6 +95,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   bool _changingMic = false;
   bool _changingCamera = false;
   bool _turningCameraOffForScreenShare = false;
+  String? _lastScreenShareError;
   CameraPosition _cameraPosition = CameraPosition.front;
   bool _resolvingHost = false;
   bool _fullScreen = false;
@@ -662,6 +663,13 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
 
   void _onScreenShareChanged() {
     _refreshChat();
+    final shareError = _screenShare?.error;
+    if (shareError == null) {
+      _lastScreenShareError = null;
+    } else if (shareError != _lastScreenShareError) {
+      _lastScreenShareError = shareError;
+      _showMediaError(shareError);
+    }
     // Stop the camera only after the screen-share track is really active. This
     // keeps the camera on when the iOS broadcast permission sheet is cancelled.
     if (_screenShare?.active == true &&
@@ -2064,9 +2072,6 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     await share.toggle();
     if (mounted && _screenShare == share && share.active && _cameraEnabled) {
       await _disableCameraForScreenShare();
-    }
-    if (mounted && _screenShare == share && share.error != null) {
-      _showMediaError(share.error!);
     }
   }
 
