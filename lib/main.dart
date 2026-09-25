@@ -1989,14 +1989,9 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                     track,
                     key: ValueKey('screen-share-${participant.identity}'),
                     fit: VideoViewFit.contain,
-                    // The nested RTCVideoPlatFormView owns and disposes its
-                    // platform controller; disposing it here as well races
-                    // the child's dispose and throws ChangeNotifier errors.
-                    autoDisposeRenderer: false,
-                    // iOS texture renderers in flutter_webrtc 1.6.x can
-                    // dispatch a final frame after disposal. Native platform
-                    // views avoid that callback race on real devices.
-                    renderMode: VideoRenderMode.platformView,
+                    // Use a Flutter texture so Flutter overlays and dialogs
+                    // can render above the video on iOS.
+                    renderMode: VideoRenderMode.texture,
                   ),
                 ),
               )
@@ -2211,11 +2206,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                           mirrorMode: isLocal
                               ? VideoViewMirrorMode.auto
                               : VideoViewMirrorMode.off,
-                          // The RTCVideoPlatFormView child owns this controller.
-                          autoDisposeRenderer: false,
-                          // Use the native iOS view to avoid a known texture
-                          // renderer teardown race during rotation/rebuilds.
-                          renderMode: VideoRenderMode.platformView,
+                          // A Flutter texture keeps dialogs and bottom sheets
+                          // above the camera feed on iOS. The renderer owns
+                          // and disposes its texture renderer normally.
+                          renderMode: VideoRenderMode.texture,
                         ),
                       ),
                     )
