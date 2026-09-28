@@ -152,6 +152,48 @@ void main() {
     await share.close();
   });
 
+  test(
+    'host stop during pending consent ends the share once it starts',
+    () async {
+      final native = FakeCapture()..publishGate = Completer<void>();
+      final share = ScreenShareController(native);
+      final start = share.toggle();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+      // A plain stop() is ignored while the start is still busy.
+      final stopped = share.stopWhenIdle();
+
+      native.publishGate!.complete();
+      await start;
+      await stopped;
+      expect(share.active, isFalse);
+      expect(native.service, isFalse);
+      expect(native.calls, [
+        'permission',
+        'service',
+        'publish',
+        'stop',
+        'restore_mic',
+      ]);
+      await share.close();
+    },
+  );
+
+  test('host stop does nothing when consent is cancelled', () async {
+    final native = FakeCapture()..permission = Completer<bool>();
+    final share = ScreenShareController(native);
+    final start = share.toggle();
+    final stopped = share.stopWhenIdle();
+
+    native.permission!.complete(false);
+    await start;
+    await stopped;
+    expect(native.calls, ['permission', 'stop']);
+    expect(share.active, isFalse);
+    expect(share.busy, isFalse);
+    await share.close();
+  });
+
   test('system-ended track stops the owned service', () async {
     final native = FakeCapture();
     final share = ScreenShareController(native);

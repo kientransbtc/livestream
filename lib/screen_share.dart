@@ -85,6 +85,16 @@ class ScreenShareController extends ChangeNotifier {
     return _run(start: false);
   }
 
+  /// Stops sharing after any start or stop in progress, so a share still
+  /// waiting for the system consent UI also ends once it starts.
+  Future<void> stopWhenIdle() async {
+    while (_busy && !_closed) {
+      await _operation;
+    }
+    if (_closed || !backend.capturing) return;
+    await stop();
+  }
+
   Future<void> _run({required bool start}) {
     _busy = true;
     _error = null;

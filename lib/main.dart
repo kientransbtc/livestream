@@ -15,6 +15,7 @@ import 'demo_livekit_token.dart';
 import 'live_chat.dart';
 import 'live_chat_overlay.dart';
 import 'media_access.dart';
+import 'microphone_router.dart';
 import 'screen_share.dart';
 
 void main() {
@@ -39,9 +40,10 @@ class LiveKitDemoApp extends StatelessWidget {
 }
 
 ///
-/// Demo này dùng data packet để mô phỏng việc host duyệt giơ tay. Khi làm thật,
-/// BE phải kiểm quyền và gọi UpdateParticipant của LiveKit; không tin quyết định
-/// approve từ một client khác.
+/// Demo này dùng data packet để mô phỏng việc host duyệt giơ tay, bật/tắt mic,
+/// camera và chia sẻ màn hình của thành viên. Khi làm thật, BE phải kiểm quyền
+/// và gọi UpdateParticipant/MutePublishedTrack của LiveKit; không tin quyết
+/// định approve từ một client khác.
 class LiveKitDemoPage extends StatefulWidget {
   const LiveKitDemoPage({
     super.key,
@@ -83,6 +85,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   EventsListener<RoomEvent>? _listener;
   LiveChatController? _chat;
   ScreenShareController? _screenShare;
+  MicrophoneRouter? _microphoneRouter;
   bool _focusedScreen = false;
   String? _connectedRoomName;
   String? _knownHostIdentity;
@@ -92,9 +95,13 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   bool _handRaised = false;
   bool _approved = false;
   bool _screenShareApproved = false;
+
+  // Members may use the camera freely until the host turns it off without
+  // allowing it back; only a host invite unblocks it.
+  bool _cameraBlocked = false;
   bool _changingMic = false;
   bool _changingCamera = false;
-  bool _turningCameraOffForScreenShare = false;
+  bool _turningCameraOff = false;
   String? _lastScreenShareError;
   CameraPosition _cameraPosition = CameraPosition.front;
   bool _resolvingHost = false;
@@ -103,6 +110,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   String? _hostNotice;
   String? _error;
   final Set<String> _waitingIdentities = <String>{};
+  final Set<_MemberMedia> _openHostInvites = <_MemberMedia>{};
 
   void _refreshPreJoin() => _preJoinRevision.value++;
 
@@ -139,6 +147,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   bool get _canUseMicrophone => _isHost || _approved;
 
   bool get _canShareScreen => _isHost || _screenShareApproved;
+
+  bool get _canUseCamera => _isHost || !_cameraBlocked;
 
   bool get _needsHostApproval => !_canUseMicrophone || !_canShareScreen;
 
@@ -271,6 +281,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _listener = null;
     _chat = null;
     _screenShare = null;
+    _microphoneRouter?.dispose();
+    _microphoneRouter = null;
     // Start the LiveKit leave signal before awaiting screen-share cleanup.
     // iOS can still be waiting for the ReplayKit picker/broadcast callback.
     final disconnection = room?.disconnect();
@@ -368,10 +380,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
             // previous 15 fps cap.
             params: VideoParameters(
               dimensions: VideoDimensionsPresets.h720_169,
-              encoding: VideoEncoding(
-                maxBitrate: 2_000_000,
-                maxFramerate: 30,
-              ),
+              encoding: VideoEncoding(maxBitrate: 2_000_000, maxFramerate: 30),
             ),
           ),
         ),
@@ -451,6 +460,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _connectedRoomName = roomName;
       _screenShare = ScreenShareController.forRoom(room)
         ..addListener(_onScreenShareChanged);
+      _microphoneRouter = MicrophoneRouter();
+      unawaited(_microphoneRouter!.apply());
       _listener = listener;
       _chat = chat..addListener(_refreshChat);
       _connectedRole = selectedRole;
@@ -474,6 +485,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _listener = null;
         _chat = null;
         _screenShare = null;
+        _microphoneRouter?.dispose();
+        _microphoneRouter = null;
         _connectedRoomName = null;
         _connectedRole = null;
         _error = 'Không kết nối được LiveKit: ${_errorMessage(e)}';
@@ -544,6 +557,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final share = _screenShare;
     room?.removeListener(_refreshParticipants);
     _screenShare = null;
+    _microphoneRouter?.dispose();
+    _microphoneRouter = null;
     _listener = null;
     _room = null;
     _chat = null;
@@ -559,9 +574,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _handRaised = false;
       _approved = false;
       _screenShareApproved = false;
+      _cameraBlocked = false;
       _changingMic = false;
       _changingCamera = false;
-      _turningCameraOffForScreenShare = false;
+      _turningCameraOff = false;
       _cameraPosition = CameraPosition.front;
       _focusedIdentity = null;
       _fullScreen = false;
@@ -689,24 +705,23 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     }
     // Stop the camera only after the screen-share track is really active. This
     // keeps the camera on when the iOS broadcast permission sheet is cancelled.
-    if (_screenShare?.active == true &&
-        _cameraEnabled &&
-        !_turningCameraOffForScreenShare) {
-      unawaited(_disableCameraForScreenShare());
+    if (_screenShare?.active == true && _cameraEnabled && !_turningCameraOff) {
+      unawaited(_turnOffLocalCamera());
     }
   }
 
-  Future<void> _disableCameraForScreenShare() async {
+  /// Used when screen sharing starts and when the host turns the camera off.
+  Future<void> _turnOffLocalCamera() async {
     final room = _room;
     final local = room?.localParticipant;
-    if (_turningCameraOffForScreenShare ||
+    if (_turningCameraOff ||
         room == null ||
         local == null ||
         !local.isCameraEnabled()) {
       return;
     }
 
-    _turningCameraOffForScreenShare = true;
+    _turningCameraOff = true;
     try {
       await local.setCameraEnabled(false);
       if (mounted && _room == room) {
@@ -718,7 +733,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _reportMediaFailure(MeetingMedia.camera, error);
       }
     } finally {
-      _turningCameraOffForScreenShare = false;
+      _turningCameraOff = false;
       if (mounted && _room == room) _refreshMeeting();
     }
   }
@@ -792,6 +807,104 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           ? 'Host từ chối yêu cầu quyền bổ sung. Quyền đã duyệt trước đó vẫn được giữ.'
           : 'Host chưa duyệt quyền phát biểu của bạn.';
       _refreshMeeting();
+    } else if (type == 'media_stopped' &&
+        !_isHost &&
+        sender == _hostParticipant?.identity) {
+      final keys = message['media'];
+      if (keys is! List) return;
+      _applyHostStop([
+        for (final media in _MemberMedia.values)
+          if (keys.contains(media.key)) media,
+      ], allowResume: message['allow_resume'] != false);
+    } else if (type == 'media_invited' &&
+        !_isHost &&
+        sender == _hostParticipant?.identity) {
+      final media = _MemberMedia.values
+          .where((value) => value.key == message['media'])
+          .firstOrNull;
+      if (media != null) _applyHostInvite(media);
+    }
+  }
+
+  /// Turns off what the host stopped. Without allow_resume the member also
+  /// loses permission: mic and share come back through a raised hand, the
+  /// camera through a host invite.
+  void _applyHostStop(List<_MemberMedia> media, {required bool allowResume}) {
+    final turnedOff = media.where(_isLocalMediaOn).toList();
+    final revoked = <_MemberMedia>[];
+    if (!allowResume) {
+      for (final value in media) {
+        if (_canUseMedia(value)) revoked.add(value);
+        _setMediaAllowed(value, false);
+      }
+    }
+    // Stopping everyone reaches every member; stay quiet when nothing changed.
+    if (turnedOff.isEmpty && revoked.isEmpty) return;
+    final list = _MemberMedia.describe(turnedOff.isEmpty ? revoked : turnedOff);
+    _hostNotice = turnedOff.isEmpty
+        ? 'Host đã thu hồi quyền dùng $list. Bạn cần host cho phép lại mới bật được.'
+        : allowResume
+        ? 'Host đã tắt $list của bạn. Bạn có thể bật lại khi cần.'
+        : 'Host đã tắt $list của bạn. Bạn cần host cho phép lại mới bật được.';
+    _refreshMeeting();
+    _showMediaError(
+      turnedOff.isEmpty
+          ? 'Host đã thu hồi quyền dùng $list.'
+          : 'Host đã tắt $list của bạn.',
+    );
+    for (final value in turnedOff) {
+      unawaited(_turnOffLocalMedia(value));
+    }
+  }
+
+  void _applyHostInvite(_MemberMedia media) {
+    _setMediaAllowed(media, true);
+    // Mic and share invites are approvals, so they answer a raised hand. The
+    // camera is not part of hand raising.
+    if (media != _MemberMedia.camera) _handRaised = false;
+    if (_isLocalMediaOn(media)) {
+      _refreshMeeting();
+      return;
+    }
+    _hostNotice = 'Host đã cho phép bạn bật ${media.label}.';
+    _refreshMeeting();
+    unawaited(_showHostInvite(media));
+  }
+
+  bool _isLocalMediaOn(_MemberMedia media) => switch (media) {
+    _MemberMedia.microphone => _micEnabled,
+    _MemberMedia.camera => _cameraEnabled,
+    // iOS publishes a share while the broadcast picker is still open, so the
+    // host can stop one that has not finished starting.
+    _MemberMedia.screenShare =>
+      (_screenShare?.active ?? false) || (_screenShare?.busy ?? false),
+  };
+
+  bool _canUseMedia(_MemberMedia media) => switch (media) {
+    _MemberMedia.microphone => _canUseMicrophone,
+    _MemberMedia.camera => _canUseCamera,
+    _MemberMedia.screenShare => _canShareScreen,
+  };
+
+  void _setMediaAllowed(_MemberMedia media, bool allowed) {
+    switch (media) {
+      case _MemberMedia.microphone:
+        _approved = allowed;
+      case _MemberMedia.camera:
+        _cameraBlocked = !allowed;
+      case _MemberMedia.screenShare:
+        _screenShareApproved = allowed;
+    }
+  }
+
+  Future<void> _turnOffLocalMedia(_MemberMedia media) async {
+    switch (media) {
+      case _MemberMedia.microphone:
+        await _muteLocalMicrophone();
+      case _MemberMedia.camera:
+        await _turnOffLocalCamera();
+      case _MemberMedia.screenShare:
+        await _screenShare?.stopWhenIdle();
     }
   }
 
@@ -1026,6 +1139,339 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _refreshMeeting();
   }
 
+  /// Asks the host how to turn off [media] for one member. Without an
+  /// [identity] the host picks what to turn off for every member.
+  Future<void> _showStopMediaDialog({
+    String? identity,
+    _MemberMedia? media,
+  }) async {
+    assert((identity == null) == (media == null));
+    if (!_isHost || _room == null) return;
+    final participant = identity == null
+        ? null
+        : _participants.where((p) => p.identity == identity).firstOrNull;
+    if (identity != null && participant == null) return;
+    final name = participant == null
+        ? ''
+        : _participantDisplayName(participant);
+    final members = _room?.remoteParticipants.values.toList() ?? const [];
+
+    final dialogState = ValueNotifier(
+      _StopDialogState(selected: {media ?? _MemberMedia.microphone}),
+    );
+    final choice = await showDialog<_StopDialogState>(
+      context: context,
+      builder: (dialogContext) => ValueListenableBuilder<_StopDialogState>(
+        valueListenable: dialogState,
+        builder: (context, state, _) => AlertDialog(
+          // Four options can be taller than a phone in landscape.
+          scrollable: true,
+          backgroundColor: const Color(0xFF222630),
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(24),
+            side: const BorderSide(color: Colors.white12),
+          ),
+          titlePadding: const EdgeInsets.fromLTRB(22, 22, 22, 8),
+          contentPadding: const EdgeInsets.fromLTRB(22, 0, 22, 8),
+          actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+          title: Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF657A).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Icon(
+                  media?.offIcon ?? Icons.do_not_disturb_on_rounded,
+                  color: const Color(0xFFFF7184),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  media?.stopAction ?? 'Tắt tất cả',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 19,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                media == null
+                    ? 'Chọn những gì cần tắt cho mọi thành viên. Của bạn vẫn giữ nguyên.'
+                    : 'Tắt ${media.label} của $name.',
+                style: const TextStyle(color: Colors.white60, height: 1.4),
+              ),
+              const SizedBox(height: 16),
+              if (media == null) ...[
+                for (final value in _MemberMedia.values) ...[
+                  _ApprovalPermissionTile(
+                    icon: value.onIcon,
+                    title: value.title,
+                    subtitle: switch (members.where(value.isOnFor).length) {
+                      0 => 'Không ai đang bật',
+                      final count => '$count người đang bật',
+                    },
+                    selected: state.selected.contains(value),
+                    onChanged: (selected) =>
+                        dialogState.value = state.select(value, selected),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                const Divider(color: Colors.white12),
+                const SizedBox(height: 10),
+              ],
+              _ApprovalPermissionTile(
+                icon: Icons.lock_open_rounded,
+                title: 'Cho phép tự bật lại',
+                subtitle: state.allowResume
+                    ? 'Thành viên có thể bật lại khi cần'
+                    : switch (media) {
+                        null => 'Thành viên cần host cho phép lại mới bật được',
+                        _MemberMedia.camera =>
+                          'Thành viên chỉ bật lại được khi host mời',
+                        _ => 'Thành viên phải giơ tay để xin lại quyền',
+                      },
+                selected: state.allowResume,
+                onChanged: (value) =>
+                    dialogState.value = state.copyWith(allowResume: value),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              style: TextButton.styleFrom(foregroundColor: Colors.white70),
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Hủy'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFFE44F68),
+                foregroundColor: Colors.white,
+                minimumSize: const Size(104, 44),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: state.selected.isEmpty
+                  ? null
+                  : () => Navigator.pop(dialogContext, state),
+              child: Text(media?.stopAction ?? 'Tắt'),
+            ),
+          ],
+        ),
+      ),
+    );
+    dialogState.dispose();
+    if (choice == null) return;
+    await _stopMemberMedia(
+      choice.selected,
+      identity,
+      allowResume: choice.allowResume,
+    );
+  }
+
+  Future<void> _stopMemberMedia(
+    Set<_MemberMedia> media,
+    String? identity, {
+    required bool allowResume,
+  }) async {
+    final room = _room;
+    if (!_isHost || room == null || media.isEmpty) return;
+    final participant = identity == null
+        ? null
+        : _participants.where((p) => p.identity == identity).firstOrNull;
+    try {
+      // Without a destination the packet reaches every member. Members only
+      // accept it from the room host, so the host's own media stay unchanged.
+      await _send({
+        'type': 'media_stopped',
+        'media': [for (final value in media) value.key],
+        'allow_resume': allowResume,
+      }, destination: identity);
+    } catch (_) {
+      if (mounted && _room == room) {
+        _showMediaError('Chưa gửi được yêu cầu tắt. Vui lòng thử lại.');
+      }
+      return;
+    }
+    if (!mounted || _room != room) return;
+    final name = participant == null
+        ? 'thành viên'
+        : _participantDisplayName(participant);
+    final target = identity == null ? 'tất cả thành viên' : name;
+    final list = _MemberMedia.describe(media);
+    _showMediaError(
+      allowResume
+          ? 'Đã tắt $list của $target.'
+          : 'Đã tắt $list của $target và thu hồi quyền bật lại.',
+    );
+  }
+
+  /// Lets a member use [media] and asks them to turn it on. The member
+  /// confirms on their device: screen capture always needs their consent,
+  /// and the mic and camera follow the same rule.
+  Future<void> _inviteMemberMedia(_MemberMedia media, String identity) async {
+    final room = _room;
+    if (!_isHost || room == null) return;
+    final participant = _participants
+        .where((p) => p.identity == identity)
+        .firstOrNull;
+    try {
+      await _send({
+        'type': 'media_invited',
+        'media': media.key,
+      }, destination: identity);
+    } catch (_) {
+      if (mounted && _room == room) {
+        _showMediaError('Chưa gửi được lời mời. Vui lòng thử lại.');
+      }
+      return;
+    }
+    if (!mounted || _room != room) return;
+    // Like an approval, a mic or share invite answers the raised hand.
+    if (media != _MemberMedia.camera && _waitingIdentities.remove(identity)) {
+      _refreshMeeting();
+    }
+    final name = participant == null
+        ? 'thành viên'
+        : _participantDisplayName(participant);
+    _showMediaError('Đã mời $name bật ${media.label}.');
+  }
+
+  Future<void> _showHostInvite(_MemberMedia media) async {
+    // A repeated invite for the same media adds nothing to an open prompt.
+    if (!_openHostInvites.add(media)) return;
+    final (title, message, action) = switch (media) {
+      _MemberMedia.microphone => (
+        'Host mời bạn phát biểu',
+        'Bật mic để mọi người nghe bạn nói.',
+        'Bật mic',
+      ),
+      _MemberMedia.camera => (
+        'Host mời bạn bật camera',
+        'Bật camera để mọi người nhìn thấy bạn.',
+        'Bật camera',
+      ),
+      _MemberMedia.screenShare => (
+        'Host mời bạn trình chiếu',
+        'Chia sẻ màn hình để mọi người xem nội dung bạn trình bày.',
+        'Chia sẻ',
+      ),
+    };
+    final bool? accepted;
+    try {
+      accepted = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          backgroundColor: const Color(0xFF222630),
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(24),
+            side: const BorderSide(color: Colors.white12),
+          ),
+          icon: Container(
+            width: 52,
+            height: 52,
+            decoration: BoxDecoration(
+              color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(media.onIcon, color: const Color(0xFF70C7FF)),
+          ),
+          title: Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          content: Text(
+            message,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.white70, height: 1.4),
+          ),
+          actionsPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+          actions: [
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white24),
+                      minimumSize: const Size(96, 46),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    onPressed: () => Navigator.pop(dialogContext, false),
+                    child: const Text('Để sau', textAlign: TextAlign.center),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF168BE7),
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(96, 46),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    onPressed: () => Navigator.pop(dialogContext, true),
+                    child: Text(action, textAlign: TextAlign.center),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+    } finally {
+      _openHostInvites.remove(media);
+    }
+    if (accepted != true || !mounted || _room == null) return;
+    // The member may have turned it on meanwhile.
+    if (_isLocalMediaOn(media)) return;
+    switch (media) {
+      case _MemberMedia.microphone:
+        await _changeMedia(MeetingMedia.microphone, true);
+      case _MemberMedia.camera:
+        await _changeMedia(MeetingMedia.camera, true);
+      case _MemberMedia.screenShare:
+        await _toggleScreenShare();
+    }
+  }
+
+  Future<void> _muteLocalMicrophone() async {
+    final room = _room;
+    final local = room?.localParticipant;
+    if (local == null || !local.isMicrophoneEnabled()) return;
+    try {
+      await local.setMicrophoneEnabled(false);
+    } catch (error) {
+      if (mounted && _room == room) {
+        _reportMediaFailure(MeetingMedia.microphone, error);
+      }
+    } finally {
+      if (mounted && _room == room) _refreshMeeting();
+    }
+  }
+
   Future<void> _toggleMic() async {
     if (!_micEnabled && !_canUseMicrophone) {
       _showMediaError('Bạn cần giơ tay và chờ chủ phòng duyệt quyền bật mic.');
@@ -1035,6 +1481,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   }
 
   Future<void> _toggleCamera() async {
+    if (!_cameraEnabled && !_canUseCamera) {
+      _showMediaError('Host đã tắt camera của bạn. Chờ host mời để bật lại.');
+      return;
+    }
     await _changeMedia(MeetingMedia.camera, !_cameraEnabled);
   }
 
@@ -1080,12 +1530,13 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     if (local == null || _changingMic || _changingCamera) return;
     final microphone = media == MeetingMedia.microphone;
     final label = microphone ? 'micro' : 'camera';
+    bool allowed() => microphone ? _canUseMicrophone : _canUseCamera;
     _changingMic = microphone;
     _changingCamera = !microphone;
     _refreshMeeting();
     try {
       if (enabled) {
-        if (microphone && !_canUseMicrophone) return;
+        if (!allowed()) return;
         final access = await _mediaAccess.request(media);
         if (!mounted || _room != room) return;
         if (access != MediaAccessResult.granted) {
@@ -1093,7 +1544,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           return;
         }
         // The host may revoke approval while the OS permission prompt is open.
-        if (microphone && !_canUseMicrophone) return;
+        if (!allowed()) return;
 
         final canPublishSource =
             !microphone ||
@@ -1113,6 +1564,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       if (!mounted || _room != room) return;
       if (microphone) {
         await local.setMicrophoneEnabled(enabled);
+        // iOS lists external inputs only once the session records.
+        if (enabled) await _microphoneRouter?.apply();
       } else {
         if (enabled) {
           // LiveKit keeps a muted camera publication and restarts it with its
@@ -1129,8 +1582,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         await local.setCameraEnabled(enabled);
         _cameraPosition = CameraPosition.front;
       }
-      if (microphone && enabled && !_canUseMicrophone) {
-        await local.setMicrophoneEnabled(false);
+      if (enabled && !allowed()) {
+        if (microphone) {
+          await local.setMicrophoneEnabled(false);
+        } else {
+          await local.setCameraEnabled(false);
+        }
       }
     } catch (error) {
       if (mounted && _room == room) {
@@ -2050,6 +2507,20 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       ),
                     ),
                   ),
+                  if (_isHost && !local)
+                    IconButton(
+                      tooltip: 'Dừng chia sẻ màn hình',
+                      icon: const Icon(
+                        Icons.stop_screen_share_rounded,
+                        color: Color(0xFFFF7184),
+                      ),
+                      onPressed: () => unawaited(
+                        _showStopMediaDialog(
+                          identity: participant.identity,
+                          media: _MemberMedia.screenShare,
+                        ),
+                      ),
+                    ),
                   IconButton(
                     tooltip: _fullScreen
                         ? 'Thu nhỏ màn hình chia sẻ'
@@ -2088,7 +2559,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
 
     await share.toggle();
     if (mounted && _screenShare == share && share.active && _cameraEnabled) {
-      await _disableCameraForScreenShare();
+      await _turnOffLocalCamera();
     }
     if (mounted && _screenShare == share && share.active && !_micEnabled) {
       _showMediaError(
@@ -2106,6 +2577,15 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         final sharedParticipants = _participants
             .where((p) => p.isScreenShareEnabled())
             .toList();
+        final members = _room?.remoteParticipants.values.toList() ?? const [];
+        final mediaInUse = [
+          for (final media in _MemberMedia.values)
+            if (members.where(media.isOnFor).length case final count
+                when count > 0)
+              '$count ${media.label}',
+        ];
+        final microphoneRouter = _microphoneRouter;
+        final microphones = microphoneRouter?.inputs ?? const <MediaDevice>[];
         return SafeArea(
           child: ListView(
             shrinkWrap: true,
@@ -2132,6 +2612,61 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   _showParticipantsSheet();
                 },
               ),
+              if (_isHost && members.isNotEmpty)
+                ListTile(
+                  leading: const Icon(
+                    Icons.do_not_disturb_on_outlined,
+                    color: Colors.white70,
+                  ),
+                  title: const Text(
+                    'Tắt tất cả',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  subtitle: Text(
+                    mediaInUse.isEmpty
+                        ? 'Mic, camera và chia sẻ của thành viên đều đang tắt'
+                        : 'Đang bật: ${mediaInUse.join(' · ')}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) unawaited(_showStopMediaDialog());
+                    });
+                  },
+                ),
+              if (microphoneRouter != null && microphones.length > 1) ...[
+                const Divider(color: Colors.white12, height: 1),
+                const ListTile(
+                  leading: Icon(Icons.mic_rounded, color: Color(0xFF80CFFF)),
+                  title: Text('Micro', style: TextStyle(color: Colors.white)),
+                  subtitle: Text(
+                    'Mic rời được chọn tự động khi cắm vào điện thoại',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                ),
+                for (final microphone in microphones)
+                  ListTile(
+                    leading: Icon(
+                      _microphoneIcon(microphone),
+                      color: Colors.white70,
+                    ),
+                    title: Text(
+                      microphone.label.isEmpty ? 'Micro' : microphone.label,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    trailing: microphone.deviceId == microphoneRouter.selectedId
+                        ? const Icon(
+                            Icons.check_rounded,
+                            color: Color(0xFF80CFFF),
+                          )
+                        : null,
+                    onTap: () {
+                      Navigator.pop(sheetContext);
+                      unawaited(microphoneRouter.select(microphone));
+                    },
+                  ),
+              ],
               if (sharedParticipants.isNotEmpty) ...[
                 const Divider(color: Colors.white12, height: 1),
                 const ListTile(
@@ -2171,6 +2706,21 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     );
   }
 
+  IconData _microphoneIcon(MediaDevice microphone) {
+    switch (MicrophoneRouter.kindOf(microphone)) {
+      case MicrophoneKind.usb:
+        return Icons.usb_rounded;
+      case MicrophoneKind.wired:
+        return Icons.headset_mic_rounded;
+      case MicrophoneKind.bluetooth:
+        return Icons.bluetooth_audio_rounded;
+      case MicrophoneKind.builtIn:
+        return Icons.phone_iphone_rounded;
+      case MicrophoneKind.other:
+        return Icons.mic_external_on_rounded;
+    }
+  }
+
   Widget _participantTile(
     Participant participant, {
     bool large = false,
@@ -2193,6 +2743,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         final actionLabel = large && _fullScreen
             ? 'Thu nhỏ'
             : 'Xem toàn màn hình';
+        final hostControls = _isHost && !isLocal;
+        // Small tiles shrink the avatar to fit between the host's controls
+        // at the top and the name at the bottom.
+        final compactAvatar = hostControls && !large;
         return Semantics(
           button: true,
           label:
@@ -2242,15 +2796,18 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       ),
                     )
                   else
-                    Center(
+                    Align(
+                      alignment: compactAvatar
+                          ? const Alignment(0, 0.2)
+                          : Alignment.center,
                       child: CircleAvatar(
-                        radius: large ? 48 : 24,
+                        radius: large ? 48 : (compactAvatar ? 20 : 24),
                         backgroundColor: const Color(0xFF464A5A),
                         child: Text(
                           initials,
                           style: TextStyle(
                             color: Colors.white,
-                            fontSize: large ? 38 : 22,
+                            fontSize: large ? 38 : (compactAvatar ? 18 : 22),
                             fontWeight: FontWeight.w600,
                           ),
                         ),
@@ -2296,15 +2853,22 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                         ),
                       ),
                     ),
-                  Positioned(
-                    top: 8,
-                    right: 8,
-                    child: Icon(
-                      cameraEnabled ? Icons.videocam : Icons.videocam_off,
-                      color: cameraEnabled ? Colors.white : Colors.white60,
-                      size: 18,
+                  if (hostControls)
+                    Positioned(
+                      top: 6,
+                      right: 6,
+                      child: _memberControls(participant, large: large),
+                    )
+                  else
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: Icon(
+                        cameraEnabled ? Icons.videocam : Icons.videocam_off,
+                        color: cameraEnabled ? Colors.white : Colors.white60,
+                        size: 18,
+                      ),
                     ),
-                  ),
                   Positioned(
                     left: 10,
                     bottom: 10,
@@ -2323,14 +2887,16 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                             ),
                           ),
                         ),
-                        const SizedBox(width: 4),
-                        Icon(
-                          micEnabled ? Icons.mic : Icons.mic_off,
-                          color: micEnabled
-                              ? Colors.greenAccent
-                              : Colors.white60,
-                          size: 18,
-                        ),
+                        if (!hostControls) ...[
+                          const SizedBox(width: 4),
+                          Icon(
+                            micEnabled ? Icons.mic : Icons.mic_off,
+                            color: micEnabled
+                                ? Colors.greenAccent
+                                : Colors.white60,
+                            size: 18,
+                          ),
+                        ],
                         if (large) ...[
                           const SizedBox(width: 8),
                           Icon(
@@ -2350,6 +2916,51 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           ),
         );
       },
+    );
+  }
+
+  /// The host's mic, camera and share toggles for a member, on a dark pill
+  /// so they stay readable over video.
+  Widget _memberControls(Participant participant, {required bool large}) {
+    final size = large ? 34.0 : 26.0;
+    final gap = SizedBox(width: large ? 4 : 2);
+    return Container(
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: const Color(0x99000000),
+        borderRadius: BorderRadius.circular(size),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _memberMediaButton(participant, _MemberMedia.microphone, size: size),
+          gap,
+          _memberMediaButton(participant, _MemberMedia.camera, size: size),
+          gap,
+          _memberMediaButton(participant, _MemberMedia.screenShare, size: size),
+        ],
+      ),
+    );
+  }
+
+  /// One toggle: it shows the current state, confirms before turning it off,
+  /// and invites the member to turn it on.
+  Widget _memberMediaButton(
+    Participant participant,
+    _MemberMedia media, {
+    required double size,
+  }) {
+    final on = media.isOnFor(participant);
+    return _RequestActionButton(
+      size: size,
+      tooltip: on ? media.stopAction : media.inviteAction,
+      color: on ? media.onColor : Colors.white60,
+      icon: on ? media.onIcon : media.offIcon,
+      onPressed: () => unawaited(
+        on
+            ? _showStopMediaDialog(identity: participant.identity, media: media)
+            : _inviteMemberMedia(media, participant.identity),
+      ),
     );
   }
 
@@ -2621,47 +3232,109 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   void _showParticipantsSheet() => showModalBottomSheet<void>(
     context: context,
     backgroundColor: const Color(0xFF24262D),
-    builder: (context) => SafeArea(
-      child: ListView(
-        shrinkWrap: true,
-        padding: const EdgeInsets.all(16),
-        children: [
-          const Text(
-            'Người tham gia',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
+    // Rebuild on room events so mic/share states and controls stay current.
+    builder: (context) => ValueListenableBuilder<int>(
+      valueListenable: _meetingRevision,
+      builder: (context, _, _) {
+        final hostIdentity = _hostParticipant?.identity;
+        final localIdentity = _room?.localParticipant?.identity;
+        final canStopAll =
+            _isHost && (_room?.remoteParticipants.isNotEmpty ?? false);
+        return SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            padding: const EdgeInsets.all(16),
+            children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Người tham gia',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  if (canStopAll)
+                    TextButton.icon(
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFFFF7184),
+                      ),
+                      onPressed: () => unawaited(_showStopMediaDialog()),
+                      icon: const Icon(
+                        Icons.do_not_disturb_on_outlined,
+                        size: 18,
+                      ),
+                      label: const Text('Tắt tất cả'),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ..._participants.map((participant) {
+                final isHost = participant.identity == hostIdentity;
+                final micEnabled = participant.isMicrophoneEnabled();
+                final canControl =
+                    _isHost && participant.identity != localIdentity;
+                return ListTile(
+                  leading: Icon(
+                    isHost ? Icons.star_rounded : Icons.person,
+                    color: Colors.white70,
+                  ),
+                  title: Text(
+                    _participantDisplayName(participant),
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                  subtitle: Text(
+                    isHost ? 'Chủ phòng' : 'Thành viên',
+                    style: const TextStyle(color: Colors.white54),
+                  ),
+                  // The host's three toggles leave no room for the
+                  // fullscreen hint; tapping the row still focuses.
+                  trailing: canControl
+                      ? Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            for (final media in _MemberMedia.values) ...[
+                              if (media != _MemberMedia.microphone)
+                                const SizedBox(width: 6),
+                              _memberMediaButton(participant, media, size: 34),
+                            ],
+                          ],
+                        )
+                      : Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              micEnabled ? Icons.mic : Icons.mic_off,
+                              color: micEnabled
+                                  ? Colors.greenAccent
+                                  : Colors.white38,
+                              size: 20,
+                            ),
+                            if (participant.isScreenShareEnabled()) ...[
+                              const SizedBox(width: 8),
+                              const Icon(
+                                Icons.screen_share_rounded,
+                                color: Color(0xFF80CFFF),
+                                size: 20,
+                              ),
+                            ],
+                            const SizedBox(width: 12),
+                            const Icon(Icons.fullscreen, color: Colors.white70),
+                          ],
+                        ),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _focusParticipant(participant);
+                  },
+                );
+              }),
+            ],
           ),
-          const SizedBox(height: 8),
-          ..._participants.map(
-            (participant) => ListTile(
-              leading: Icon(
-                participant.identity == _hostParticipant?.identity
-                    ? Icons.star_rounded
-                    : Icons.person,
-                color: Colors.white70,
-              ),
-              title: Text(
-                _participantDisplayName(participant),
-                style: const TextStyle(color: Colors.white),
-              ),
-              subtitle: Text(
-                participant.identity == _hostParticipant?.identity
-                    ? 'Chủ phòng'
-                    : 'Thành viên',
-                style: const TextStyle(color: Colors.white54),
-              ),
-              trailing: const Icon(Icons.fullscreen, color: Colors.white70),
-              onTap: () {
-                Navigator.pop(context);
-                _focusParticipant(participant);
-              },
-            ),
-          ),
-        ],
-      ),
+        );
+      },
     ),
   );
 
@@ -2956,27 +3629,35 @@ class _RequestActionButton extends StatelessWidget {
     required this.color,
     required this.icon,
     required this.onPressed,
+    this.size = 40,
   });
 
   final String tooltip;
   final Color color;
   final IconData icon;
   final VoidCallback onPressed;
+  final double size;
 
   @override
   Widget build(BuildContext context) {
-    return Tooltip(
-      message: tooltip,
-      child: Material(
-        color: color.withValues(alpha: 0.14),
-        shape: const CircleBorder(),
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: onPressed,
-          child: SizedBox(
-            width: 40,
-            height: 40,
-            child: Icon(icon, color: color, size: 21),
+    // Its own semantics node, so screen readers can reach it inside a
+    // tappable participant tile.
+    return Semantics(
+      container: true,
+      button: true,
+      child: Tooltip(
+        message: tooltip,
+        child: Material(
+          color: color.withValues(alpha: 0.14),
+          shape: const CircleBorder(),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: onPressed,
+            child: SizedBox(
+              width: size,
+              height: size,
+              child: Icon(icon, color: color, size: size * 0.525),
+            ),
           ),
         ),
       ),
@@ -3011,3 +3692,93 @@ class _ApprovalDialogState {
 }
 
 enum _DemoRole { host, audience }
+
+/// Member media the host can turn off, or invite the member to turn on.
+enum _MemberMedia {
+  microphone(
+    key: 'mic',
+    label: 'mic',
+    title: 'Micro',
+    stopAction: 'Tắt mic',
+    inviteAction: 'Mời bật mic',
+    onIcon: Icons.mic_rounded,
+    offIcon: Icons.mic_off_rounded,
+    onColor: Colors.greenAccent,
+  ),
+  camera(
+    key: 'camera',
+    label: 'camera',
+    title: 'Camera',
+    stopAction: 'Tắt camera',
+    inviteAction: 'Mời bật camera',
+    onIcon: Icons.videocam_rounded,
+    offIcon: Icons.videocam_off_rounded,
+    onColor: Colors.white,
+  ),
+  screenShare(
+    key: 'screen_share',
+    label: 'chia sẻ màn hình',
+    title: 'Chia sẻ màn hình',
+    stopAction: 'Dừng chia sẻ',
+    inviteAction: 'Mời chia sẻ màn hình',
+    onIcon: Icons.screen_share_rounded,
+    offIcon: Icons.stop_screen_share_rounded,
+    onColor: Color(0xFF80CFFF),
+  );
+
+  const _MemberMedia({
+    required this.key,
+    required this.label,
+    required this.title,
+    required this.stopAction,
+    required this.inviteAction,
+    required this.onIcon,
+    required this.offIcon,
+    required this.onColor,
+  });
+
+  /// Name used in the host's data packets.
+  final String key;
+
+  /// Lowercase name used inside sentences.
+  final String label;
+  final String title;
+  final String stopAction;
+  final String inviteAction;
+  final IconData onIcon;
+  final IconData offIcon;
+  final Color onColor;
+
+  bool isOnFor(Participant participant) => switch (this) {
+    _MemberMedia.microphone => participant.isMicrophoneEnabled(),
+    _MemberMedia.camera => participant.isCameraEnabled(),
+    _MemberMedia.screenShare => participant.isScreenShareEnabled(),
+  };
+
+  /// Labels in a fixed order, e.g. "mic, camera và chia sẻ màn hình".
+  static String describe(Iterable<_MemberMedia> media) {
+    final labels = [
+      for (final value in values)
+        if (media.contains(value)) value.label,
+    ];
+    if (labels.length < 2) return labels.join();
+    return '${labels.take(labels.length - 1).join(', ')} và ${labels.last}';
+  }
+}
+
+class _StopDialogState {
+  const _StopDialogState({required this.selected, this.allowResume = true});
+
+  final Set<_MemberMedia> selected;
+  final bool allowResume;
+
+  _StopDialogState select(_MemberMedia media, bool value) => _StopDialogState(
+    selected: value ? {...selected, media} : ({...selected}..remove(media)),
+    allowResume: allowResume,
+  );
+
+  _StopDialogState copyWith({bool? allowResume}) => _StopDialogState(
+    selected: selected,
+    allowResume: allowResume ?? this.allowResume,
+  );
+}
