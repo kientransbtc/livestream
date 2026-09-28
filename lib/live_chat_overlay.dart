@@ -139,7 +139,7 @@ class _LiveChatOverlayState extends State<LiveChatOverlay> {
                                 child: Text(
                                   compact
                                       ? 'Chưa có tin nhắn'
-                                      : 'Chào cả lớp 👋\nGửi tin nhắn đầu tiên nhé!',
+                                      : 'Gửi tin nhắn đầu tiên nhé!',
                                   textAlign: TextAlign.center,
                                   maxLines: compact ? 1 : 2,
                                   overflow: TextOverflow.ellipsis,
