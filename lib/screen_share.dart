@@ -12,6 +12,8 @@ import 'package:livekit_client/livekit_client.dart';
 // ignore: implementation_imports
 import 'package:livekit_client/src/managers/broadcast_manager.dart';
 
+import 'meeting_audio_session.dart';
+
 /// Native capture is separate from the UI so cancellation/cleanup can be tested.
 abstract class ScreenShareBackend {
   bool get active;
@@ -285,14 +287,19 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
     if (_ios) await _enableMixableAudioSession();
   }
 
-  /// LiveKit's automatic iOS session is playAndRecord without mixWithOthers.
-  /// While broadcasting, the presenter plays media in another app; that app's
-  /// non-mixable session then interrupts ours, which stops the WebRTC mic
-  /// capture that ReplayKit app audio is mixed into, so nobody hears it.
+  /// The meeting's (or LiveKit's automatic) iOS session is playAndRecord
+  /// without mixWithOthers. While broadcasting, the presenter plays media in
+  /// another app; that app's non-mixable session then interrupts ours, which
+  /// stops the WebRTC mic capture that ReplayKit app audio is mixed into, so
+  /// nobody hears it.
   Future<void> _enableMixableAudioSession() async {
+    if (_ownsMixableAudioSession) return;
+    if (await MeetingAudioSession.setMixable(true)) {
+      _ownsMixableAudioSession = true;
+      return;
+    }
     final manager = AudioManager.instance;
-    if (_ownsMixableAudioSession ||
-        manager.managementMode != AudioSessionManagementMode.automatic) {
+    if (manager.managementMode != AudioSessionManagementMode.automatic) {
       return;
     }
     try {
@@ -329,6 +336,7 @@ class _LiveKitScreenShareBackend implements ScreenShareBackend {
   Future<void> _restoreAudioSession() async {
     if (!_ownsMixableAudioSession) return;
     _ownsMixableAudioSession = false;
+    if (await MeetingAudioSession.setMixable(false)) return;
     // Hands the session back to LiveKit, which reapplies its managed policy.
     await AudioManager.instance.setAudioSessionManagementMode(
       AudioSessionManagementMode.automatic,

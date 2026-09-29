@@ -15,6 +15,7 @@ import 'demo_livekit_token.dart';
 import 'live_chat.dart';
 import 'live_chat_overlay.dart';
 import 'media_access.dart';
+import 'meeting_audio_session.dart';
 import 'microphone_router.dart';
 import 'screen_share.dart';
 
@@ -111,10 +112,23 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   String? _error;
   final Set<String> _waitingIdentities = <String>{};
   final Set<_MemberMedia> _openHostInvites = <_MemberMedia>{};
+  bool _holdsAudioSession = false;
+
+  // Names members announce over the control channel. The backend's LiveKit
+  // name can carry an id, and not every token lets a member rename itself.
+  final Map<String, String> _announcedNames = <String, String>{};
 
   void _refreshPreJoin() => _preJoinRevision.value++;
 
   void _refreshMeeting() => _meetingRevision.value++;
+
+  void _dismissHostNotice() {
+    _hostNotice = null;
+    _refreshMeeting();
+  }
+
+  static bool _isLandscape(BuildContext context) =>
+      MediaQuery.orientationOf(context) == Orientation.landscape;
 
   bool get _isBackendAutoConnect =>
       widget.autoConnect && widget.participantToken?.trim().isNotEmpty == true;
@@ -277,10 +291,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final listener = _listener;
     final chat = _chat;
     final share = _screenShare;
+    final holdsAudioSession = _holdsAudioSession;
     _room = null;
     _listener = null;
     _chat = null;
     _screenShare = null;
+    _holdsAudioSession = false;
     _microphoneRouter?.dispose();
     _microphoneRouter = null;
     // Start the LiveKit leave signal before awaiting screen-share cleanup.
@@ -299,6 +315,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       try {
         await room?.dispose();
       } catch (_) {}
+      if (holdsAudioSession) await MeetingAudioSession.release();
     }());
     _roomController.dispose();
     _nameController.dispose();
@@ -340,6 +357,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     Room? pendingRoom;
     EventsListener<RoomEvent>? pendingListener;
     LiveChatController? pendingChat;
+    var holdsAudioSession = false;
     _connecting = true;
     _error = null;
     _hostNotice = null;
@@ -390,6 +408,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       final chat = LiveChatController.forRoom(
         room,
         localDisplayName: widget.initialParticipantName,
+        // Members' images go to the room host alone.
+        isHost: () => _isHost,
+        hostIdentity: () => _hostParticipant?.identity,
+        announcedName: (identity) => _announcedNames[identity],
       );
       pendingChat = chat;
       final listener = room.createListener();
@@ -415,13 +437,18 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           _knownHostIdentity = null;
           _hostNotice = 'Chủ phòng đã rời khỏi phòng.';
         }
+        _announcedNames.remove(event.participant.identity);
         _refreshParticipants();
       });
       listener.on<ParticipantMetadataUpdatedEvent>(
         (_) => _refreshParticipants(),
       );
       listener.on<ParticipantNameUpdatedEvent>((_) => _refreshParticipants());
-      listener.on<RoomReconnectedEvent>((_) => _refreshParticipants());
+      listener.on<RoomReconnectedEvent>((_) {
+        // Packets sent while the connection was down are lost.
+        unawaited(_announceName());
+        _refreshParticipants();
+      });
       listener.on<TrackMutedEvent>((_) => _refreshParticipants());
       listener.on<TrackUnmutedEvent>((_) => _refreshParticipants());
       listener.on<TrackPublishedEvent>((event) {
@@ -442,6 +469,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       listener.on<LocalTrackUnpublishedEvent>((_) {
         _refreshParticipants();
       });
+      // Before connecting, so remote audio never starts in LiveKit's
+      // listen-only session.
+      await MeetingAudioSession.acquire();
+      holdsAudioSession = true;
       // Keep remote audio/video subscriptions enabled for incoming participants.
       await room.connect(
         serverUrl,
@@ -452,9 +483,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         chat.dispose();
         await listener.dispose();
         await room.dispose();
+        await MeetingAudioSession.release();
         return;
       }
       _room = room;
+      _holdsAudioSession = true;
+      holdsAudioSession = false;
       room.addListener(_refreshParticipants);
       _knownHostIdentity = _hostParticipant?.identity;
       _connectedRoomName = roomName;
@@ -467,19 +501,34 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _connectedRole = selectedRole;
       _roomNotifier.value = room;
       _syncLocalParticipantName(room);
+      unawaited(_announceName());
       _refreshMeeting();
-      if (!room.localParticipant!.permissions.canSubscribe) {
+      final permissions = room.localParticipant!.permissions;
+      if (!permissions.canSubscribe) {
         _showMediaError(
           'Token LiveKit chưa cấp quyền nghe track. BE cần cấp canSubscribe=true cho thành viên.',
         );
+      } else if (!permissions.canPublishData) {
+        _showMediaError(_dataPermissionMissing);
       }
       await _resolveHost();
+      if (kDebugMode) {
+        debugPrint(
+          '[Hisale Coaching Hub] Joined as ${_isHost ? 'host' : 'member'}; '
+          'host: ${_hostParticipant?.identity ?? 'none'}; '
+          'canPublishData: ${permissions.canPublishData}',
+        );
+      }
       // Join without capture. Each media button requests its device permission
       // before starting capture; a denied camera never prevents mic access.
     } catch (e) {
       pendingChat?.dispose();
       await pendingListener?.dispose();
       await pendingRoom?.dispose();
+      if (holdsAudioSession || _holdsAudioSession) {
+        _holdsAudioSession = false;
+        await MeetingAudioSession.release();
+      }
       if (mounted) {
         _room = null;
         _listener = null;
@@ -540,12 +589,21 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         SnackBar(
           behavior: SnackBarBehavior.floating,
           margin: EdgeInsets.fromLTRB(16, 0, 16, bottomGap),
+          // The content fills the bar, so a tap anywhere closes it.
+          padding: EdgeInsets.zero,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
             side: const BorderSide(color: Color(0xFF6AA9D8)),
           ),
           backgroundColor: const Color(0xFF1B3047),
-          content: Text(message),
+          content: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => messenger.hideCurrentSnackBar(),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              child: Text(message),
+            ),
+          ),
         ),
       );
   }
@@ -555,13 +613,16 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final listener = _listener;
     final chat = _chat;
     final share = _screenShare;
+    final holdsAudioSession = _holdsAudioSession;
     room?.removeListener(_refreshParticipants);
     _screenShare = null;
+    _holdsAudioSession = false;
     _microphoneRouter?.dispose();
     _microphoneRouter = null;
     _listener = null;
     _room = null;
     _chat = null;
+    _announcedNames.clear();
     _connectedRoomName = null;
     _knownHostIdentity = null;
     _connectedRole = null;
@@ -601,6 +662,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     try {
       await room?.dispose();
     } catch (_) {}
+    if (holdsAudioSession) await MeetingAudioSession.release();
     if (mounted) {
       _connecting = false;
       _refreshPreJoin();
@@ -679,11 +741,19 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         ],
       ),
     );
-    if (shouldExit != true) return;
+    if (shouldExit != true || !mounted) return;
+    ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
+    final navigator = Navigator.of(context);
+    if (navigator.canPop()) {
+      // Keep the meeting on screen while the page slides away; dispose()
+      // leaves the room once the route is gone. Leaving first swapped in the
+      // connecting screen and ran the native teardown during the transition,
+      // which made the exit stutter.
+      navigator.pop();
+      return;
+    }
     final cleanup = _disconnect();
-    if (!mounted) return;
-    final didPop = await Navigator.of(context).maybePop();
-    if (!didPop) await SystemNavigator.pop();
+    await SystemNavigator.pop();
     await cleanup;
   }
 
@@ -762,7 +832,23 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     }
     final type = message['type'];
     final sender = event.participant?.identity;
-    if (type == 'hand_raise' && _isHost && sender != null) {
+    if (kDebugMode) {
+      debugPrint(
+        '[Hisale Coaching Hub] Received $type from ${sender ?? 'unknown'} '
+        '(${_isHost ? 'host' : 'member'})',
+      );
+    }
+    if (type == 'display_name' && sender != null) {
+      final name = message['name'];
+      if (name is! String || name.trim().isEmpty) return;
+      // Everyone announces on joining; answer a newcomer, who could not
+      // hear the announcements made before it arrived.
+      if (!_announcedNames.containsKey(sender)) {
+        unawaited(_announceName(identity: sender));
+      }
+      _announcedNames[sender] = name.trim().characters.take(60).toString();
+      _refreshMeeting();
+    } else if (type == 'hand_raise' && _isHost && sender != null) {
       _waitingIdentities.add(sender);
       _refreshMeeting();
     } else if (type == 'hand_cancel' && _isHost && sender != null) {
@@ -922,9 +1008,35 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     );
   }
 
+  /// Tells [identity], or everyone, the name to show for this device.
+  Future<void> _announceName({String? identity}) async {
+    final name = widget.initialParticipantName?.trim() ?? '';
+    if (name.isEmpty) return;
+    try {
+      await _send({
+        'type': 'display_name',
+        'name': name,
+      }, destination: identity);
+    } catch (_) {
+      // Peers keep showing the LiveKit name.
+    }
+  }
+
   Future<void> _raiseHand() async {
     final room = _room;
     if (room == null || _isHost || _handRaised || !_needsHostApproval) return;
+    // LiveKit sends without this grant, and the server silently drops it.
+    if (room.localParticipant?.permissions.canPublishData != true) {
+      _showMediaError(_dataPermissionMissing);
+      return;
+    }
+    // Nobody could approve it, and a host who joins later never receives it.
+    if (_hostParticipant == null) {
+      _showMediaError(
+        'Chưa có chủ phòng trong phòng nên chưa duyệt được. Hãy giơ tay lại khi chủ phòng vào.',
+      );
+      return;
+    }
 
     // Set this before sending: the host can approve immediately, and the
     // response must not be discarded as arriving before the request state.
@@ -1564,8 +1676,9 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       if (!mounted || _room != room) return;
       if (microphone) {
         await local.setMicrophoneEnabled(enabled);
-        // iOS lists external inputs only once the session records.
-        if (enabled) await _microphoneRouter?.apply();
+        // iOS may list external inputs only once the session records, and
+        // starting to record can move the route back to the phone's mic.
+        if (enabled) await _microphoneRouter?.apply(reselect: true);
       } else {
         if (enabled) {
           // LiveKit keeps a muted camera publication and restarts it with its
@@ -1691,6 +1804,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       ),
                     )
                   : null)
+            // Like Meet, a phone turned sideways gives the meeting the full
+            // height; the camera switch moves into the control bar.
+            : _isLandscape(context)
+            ? null
             : PreferredSize(
                 preferredSize: const Size.fromHeight(kToolbarHeight),
                 child: ValueListenableBuilder<int>(
@@ -2233,40 +2350,42 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     return Column(
       children: [
         if (_hostNotice != null && !keyboardVisible)
-          Container(
-            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-            padding: const EdgeInsets.only(left: 12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF263952),
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Row(
-              children: [
-                const Icon(
-                  Icons.info_outline,
-                  color: Color(0xFF84C9FF),
-                  size: 20,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    _hostNotice!,
-                    style: const TextStyle(color: Colors.white, fontSize: 13),
+          GestureDetector(
+            // A tap anywhere on the notice closes it, like the close button.
+            behavior: HitTestBehavior.opaque,
+            onTap: _dismissHostNotice,
+            child: Container(
+              margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              padding: const EdgeInsets.only(left: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF263952),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.info_outline,
+                    color: Color(0xFF84C9FF),
+                    size: 20,
                   ),
-                ),
-                IconButton(
-                  tooltip: 'Đóng thông báo',
-                  onPressed: () {
-                    _hostNotice = null;
-                    _refreshMeeting();
-                  },
-                  icon: const Icon(
-                    Icons.close,
-                    color: Colors.white70,
-                    size: 18,
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _hostNotice!,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                    ),
                   ),
-                ),
-              ],
+                  IconButton(
+                    tooltip: 'Đóng thông báo',
+                    onPressed: _dismissHostNotice,
+                    icon: const Icon(
+                      Icons.close,
+                      color: Colors.white70,
+                      size: 18,
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         Expanded(
@@ -2558,6 +2677,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     }
 
     await share.toggle();
+    // Sharing changes the iOS audio session, which can drop the mic route.
+    if (mounted && _screenShare == share) {
+      unawaited(_microphoneRouter?.apply(reselect: true));
+    }
     if (mounted && _screenShare == share && share.active && _cameraEnabled) {
       await _turnOffLocalCamera();
     }
@@ -2796,19 +2919,25 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       ),
                     )
                   else
-                    Align(
-                      alignment: compactAvatar
-                          ? const Alignment(0, 0.2)
-                          : Alignment.center,
-                      child: CircleAvatar(
-                        radius: large ? 48 : (compactAvatar ? 20 : 24),
-                        backgroundColor: const Color(0xFF464A5A),
-                        child: Text(
-                          initials,
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: large ? 38 : (compactAvatar ? 18 : 22),
-                            fontWeight: FontWeight.w600,
+                    Padding(
+                      // Below the controls (6 + 36 px) and above the name.
+                      padding: compactAvatar
+                          ? const EdgeInsets.fromLTRB(8, 46, 8, 26)
+                          : EdgeInsets.zero,
+                      child: Center(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: CircleAvatar(
+                            radius: large ? 48 : 24,
+                            backgroundColor: const Color(0xFF464A5A),
+                            child: Text(
+                              initials,
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: large ? 38 : 22,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
                           ),
                         ),
                       ),
@@ -2922,10 +3051,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   /// The host's mic, camera and share toggles for a member, on a dark pill
   /// so they stay readable over video.
   Widget _memberControls(Participant participant, {required bool large}) {
-    final size = large ? 34.0 : 26.0;
-    final gap = SizedBox(width: large ? 4 : 2);
+    final size = large ? 34.0 : 28.0;
+    final gap = SizedBox(width: large ? 8 : 6);
     return Container(
-      padding: const EdgeInsets.all(3),
+      padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
         color: const Color(0x99000000),
         borderRadius: BorderRadius.circular(size),
@@ -2969,6 +3098,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final requestedName = widget.initialParticipantName?.trim() ?? '';
     if (isLocal && requestedName.isNotEmpty) return requestedName;
 
+    final announcedName = _announcedNames[participant.identity];
+    if (announcedName != null) return announcedName;
     final liveKitName = participant.name.trim();
     return liveKitName.isNotEmpty ? liveKitName : participant.identity;
   }
@@ -3100,6 +3231,14 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         enabled: !_changingCamera && !_changingMic,
         active: _cameraEnabled,
       ),
+      // In portrait this sits in the app bar, which landscape hides.
+      if (_cameraEnabled && _isLandscape(context))
+        _controlButton(
+          Icons.flip_camera_ios,
+          _cameraPosition == CameraPosition.front ? 'Cam sau' : 'Cam trước',
+          _switchCamera,
+          enabled: !_changingCamera && !_changingMic,
+        ),
       // Chat is a primary action and stays visible without horizontal scroll.
       _controlButton(
         (_chat?.visible ?? false)
@@ -3338,126 +3477,162 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     ),
   );
 
+  static const _waitingSheetColor = Color(0xFF20242C);
+
+  static const _dataPermissionMissing =
+      'Token LiveKit chưa cấp quyền gửi dữ liệu nên giơ tay và chat không tới '
+      'được chủ phòng. BE cần cấp canPublishData=true.';
+
+  /// The host drags it up when many members wait, or down to close it.
   void _showWaitingSheet() => showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
     backgroundColor: Colors.transparent,
-    builder: (sheetContext) => ValueListenableBuilder<int>(
-      valueListenable: _meetingRevision,
-      builder: (context, _, _) => Container(
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.of(context).size.height * 0.76,
-        ),
+    builder: (sheetContext) => DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.5,
+      minChildSize: 0.3,
+      maxChildSize: 0.92,
+      snap: true,
+      snapSizes: const [0.5],
+      builder: (context, scrollController) => Container(
+        clipBehavior: Clip.antiAlias,
         decoration: BoxDecoration(
-          color: const Color(0xFF20242C),
+          color: _waitingSheetColor,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
           border: Border.all(color: Colors.white12),
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const SizedBox(height: 10),
-            Container(
-              width: 38,
-              height: 4,
-              decoration: BoxDecoration(
-                color: Colors.white30,
-                borderRadius: BorderRadius.circular(4),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
-              child: Row(
-                children: [
-                  Container(
-                    width: 46,
-                    height: 46,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
-                      borderRadius: BorderRadius.circular(15),
-                    ),
-                    child: const Icon(
-                      Icons.front_hand_rounded,
-                      color: Color(0xFF70C7FF),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'Yêu cầu phát biểu',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 19,
-                            fontWeight: FontWeight.w700,
+        child: ValueListenableBuilder<int>(
+          valueListenable: _meetingRevision,
+          builder: (context, _, _) {
+            // useSafeArea leaves the home indicator inside the sheet.
+            final bottomInset = MediaQuery.paddingOf(context).bottom;
+            return CustomScrollView(
+              controller: scrollController,
+              slivers: [
+                // Pinned inside the scroll view, so dragging the header
+                // resizes the sheet too.
+                PinnedHeaderSliver(child: _waitingSheetHeader()),
+                if (_waitingIdentities.isEmpty)
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        24,
+                        30,
+                        24,
+                        34 + bottomInset,
+                      ),
+                      child: const Column(
+                        children: [
+                          Icon(
+                            Icons.hourglass_empty_rounded,
+                            color: Colors.white38,
+                            size: 30,
                           ),
-                        ),
-                        SizedBox(height: 3),
-                        Text(
-                          'Duyệt quyền mic hoặc chia sẻ màn hình',
-                          style: TextStyle(color: Colors.white60, fontSize: 12),
-                        ),
-                      ],
+                          SizedBox(height: 10),
+                          Text(
+                            'Không còn yêu cầu đang chờ.',
+                            style: TextStyle(color: Colors.white60),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 11,
-                      vertical: 7,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF43B5FF).withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      '${_waitingIdentities.length}',
-                      style: const TextStyle(
-                        color: Color(0xFF70C7FF),
-                        fontWeight: FontWeight.w700,
+                  )
+                else
+                  SliverPadding(
+                    padding: EdgeInsets.fromLTRB(16, 14, 16, 20 + bottomInset),
+                    sliver: SliverList.separated(
+                      itemCount: _waitingIdentities.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 10),
+                      itemBuilder: (context, index) => _waitingRequestTile(
+                        sheetContext,
+                        _waitingIdentities.elementAt(index),
                       ),
                     ),
                   ),
-                ],
+              ],
+            );
+          },
+        ),
+      ),
+    ),
+  );
+
+  Widget _waitingSheetHeader() => ColoredBox(
+    // Opaque, so requests scroll under the pinned header.
+    color: _waitingSheetColor,
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(height: 10),
+        Container(
+          width: 38,
+          height: 4,
+          decoration: BoxDecoration(
+            color: Colors.white30,
+            borderRadius: BorderRadius.circular(4),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+          child: Row(
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: const Icon(
+                  Icons.front_hand_rounded,
+                  color: Color(0xFF70C7FF),
+                ),
               ),
-            ),
-            const Divider(height: 1, color: Colors.white12),
-            if (_waitingIdentities.isEmpty)
-              const Padding(
-                padding: EdgeInsets.fromLTRB(24, 30, 24, 34),
+              const SizedBox(width: 12),
+              const Expanded(
                 child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Icon(
-                      Icons.hourglass_empty_rounded,
-                      color: Colors.white38,
-                      size: 30,
-                    ),
-                    SizedBox(height: 10),
                     Text(
-                      'Không còn yêu cầu đang chờ.',
-                      style: TextStyle(color: Colors.white60),
+                      'Yêu cầu phát biểu',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    SizedBox(height: 3),
+                    Text(
+                      'Duyệt quyền mic hoặc chia sẻ màn hình',
+                      style: TextStyle(color: Colors.white60, fontSize: 12),
                     ),
                   ],
                 ),
-              )
-            else
-              Flexible(
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  padding: const EdgeInsets.fromLTRB(16, 14, 16, 20),
-                  itemCount: _waitingIdentities.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 10),
-                  itemBuilder: (context, index) => _waitingRequestTile(
-                    sheetContext,
-                    _waitingIdentities.elementAt(index),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 11,
+                  vertical: 7,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF43B5FF).withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  '${_waitingIdentities.length}',
+                  style: const TextStyle(
+                    color: Color(0xFF70C7FF),
+                    fontWeight: FontWeight.w700,
                   ),
                 ),
               ),
-          ],
+            ],
+          ),
         ),
-      ),
+        const Divider(height: 1, color: Colors.white12),
+      ],
     ),
   );
 

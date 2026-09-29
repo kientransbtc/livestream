@@ -68,7 +68,12 @@ class MicrophoneRouter extends ChangeNotifier {
   }
 
   /// Re-evaluates the inputs; serialized so device events cannot interleave.
-  Future<void> apply() => _queue = _queue.then((_) => _apply());
+  ///
+  /// [reselect] routes to the chosen external mic again even when it is
+  /// already selected, since starting to record can hand the route back to
+  /// the phone's mic.
+  Future<void> apply({bool reselect = false}) =>
+      _queue = _queue.then((_) => _apply(reselect: reselect));
 
   /// Keeps [device] until it is unplugged, then returns to automatic choice.
   Future<void> select(MediaDevice device) {
@@ -76,14 +81,17 @@ class MicrophoneRouter extends ChangeNotifier {
     return apply();
   }
 
-  Future<void> _apply() async {
+  Future<void> _apply({required bool reselect}) async {
     if (!_supported || _disposed) return;
     try {
       final inputs = await _listInputs();
       if (_disposed) return;
       _inputs = inputs;
       final target = _pick(inputs);
-      if (target != null && target.deviceId != _selectedId) {
+      final external =
+          target != null && kindOf(target) != MicrophoneKind.builtIn;
+      if (target != null &&
+          (target.deviceId != _selectedId || (reselect && external))) {
         // The OS already records from the built-in mic by default.
         final needsSwitch =
             _selectedId != null ||

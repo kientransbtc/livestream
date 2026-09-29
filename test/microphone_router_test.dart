@@ -78,4 +78,19 @@ void main() {
     await router.apply();
     expect(router.selectedId, 'usb-rx');
   });
+
+  test('starting the mic routes to the external mic again', () async {
+    inputs.add(mic('usb-rx', 'usb'));
+    await router.apply();
+    await router.apply();
+    expect(selected, ['usb-rx']);
+
+    await router.apply(reselect: true);
+    expect(selected, ['usb-rx', 'usb-rx']);
+  });
+
+  test('reselecting leaves the built-in mic alone', () async {
+    await router.apply(reselect: true);
+    expect(selected, isEmpty);
+  });
 }
