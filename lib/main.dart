@@ -91,6 +91,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   String? _connectedRoomName;
   String? _knownHostIdentity;
   bool _roomRefreshScheduled = false;
+  Timer? _roomChangeTimer;
   bool _roomRefreshNeedsHostResolve = false;
   bool _connecting = false;
   bool _handRaised = false;
@@ -207,9 +208,11 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final host = _hostParticipant;
     if (host == null) return;
     _resolvingHost = true;
+    var acted = false;
     try {
       if (host.identity != local.identity) {
         if (!mounted) return;
+        acted = true;
         _connectedRole = _DemoRole.audience;
         _approved = false;
         _screenShareApproved = false;
@@ -219,6 +222,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         await local.setMicrophoneEnabled(false);
         await local.setMetadata(jsonEncode({'role': 'audience'}));
       } else if (_participantMetadata(local)['host_state'] == 'claiming') {
+        acted = true;
         await local.setMetadata(
           jsonEncode({'role': 'host', 'host_state': 'active'}),
         );
@@ -233,12 +237,26 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     } finally {
       _resolvingHost = false;
       if (mounted && _room == room) {
-        _refreshMeeting();
+        // This runs after every room event; most of the time nothing changes.
+        if (acted) _refreshMeeting();
         if (_isHost && _hostParticipant?.identity != local.identity) {
           unawaited(_resolveHost());
         }
       }
     }
+  }
+
+  /// The room notifies on every event, including the speaker levels LiveKit
+  /// sends several times a second while someone talks. Rebuilding the whole
+  /// meeting for each kept the Dart GC busy (half the app's CPU on an iPhone
+  /// 16). Events that change the layout have their own listeners, so this
+  /// catch-all only needs to run a few times a second.
+  void _onRoomChanged() {
+    if (_roomChangeTimer?.isActive ?? false) return;
+    _roomChangeTimer = Timer(
+      const Duration(milliseconds: 250),
+      _refreshParticipants,
+    );
   }
 
   void _refreshParticipants() {
@@ -264,13 +282,16 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       if (!mounted || _room == null) return;
       final participants = _participants;
       final identities = participants.map((p) => p.identity).toSet();
+      final waiting = _waitingIdentities.length;
       _waitingIdentities.removeWhere(
         (identity) => !identities.contains(identity),
       );
+      var changed = _waitingIdentities.length != waiting;
       if (_focusedIdentity != null && !identities.contains(_focusedIdentity)) {
         _focusedIdentity = null;
         _focusedScreen = false;
         _fullScreen = false;
+        changed = true;
       }
       if (_focusedScreen &&
           !participants.any(
@@ -279,8 +300,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _focusedIdentity = null;
         _focusedScreen = false;
         _fullScreen = false;
+        changed = true;
       }
-      _refreshMeeting();
+      // The event itself was already shown by the immediate refresh.
+      if (changed) _refreshMeeting();
       if (shouldResolveHost) unawaited(_resolveHost());
     });
   }
@@ -304,7 +327,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final disconnection = room?.disconnect();
     chat?.dispose();
     listener?.dispose();
-    room?.removeListener(_refreshParticipants);
+    room?.removeListener(_onRoomChanged);
+    _roomChangeTimer?.cancel();
     unawaited(() async {
       try {
         await share?.close();
@@ -489,7 +513,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _room = room;
       _holdsAudioSession = true;
       holdsAudioSession = false;
-      room.addListener(_refreshParticipants);
+      room.addListener(_onRoomChanged);
       _knownHostIdentity = _hostParticipant?.identity;
       _connectedRoomName = roomName;
       _screenShare = ScreenShareController.forRoom(room)
@@ -614,7 +638,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final chat = _chat;
     final share = _screenShare;
     final holdsAudioSession = _holdsAudioSession;
-    room?.removeListener(_refreshParticipants);
+    room?.removeListener(_onRoomChanged);
+    _roomChangeTimer?.cancel();
     _screenShare = null;
     _holdsAudioSession = false;
     _microphoneRouter?.dispose();
