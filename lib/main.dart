@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
 import 'package:livekit_client/livekit_client.dart';
 
 // LiveKit 2.13.0 does not export its broadcast controls from the main library.
@@ -131,12 +132,36 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   static bool _isLandscape(BuildContext context) =>
       MediaQuery.orientationOf(context) == Orientation.landscape;
 
+  /// Gain on everyone else's voice; WebRTC accepts 0–10 and limits peaks
+  /// after mixing. Phones play calls through the quieter voice-processing
+  /// path, where unity gain sounded too soft. Kept while the app runs.
+  static final _speakerGain = ValueNotifier<double>(3.0);
+
+  Future<void> _applySpeakerGain(Track? track) async {
+    if (track is! RemoteAudioTrack) return;
+    try {
+      await rtc.Helper.setVolume(_speakerGain.value, track.mediaStreamTrack);
+    } catch (error) {
+      debugPrint('[Hisale Coaching Hub] Could not set speaker volume: $error');
+    }
+  }
+
+  void _applySpeakerGainToAll() {
+    final participants = _room?.remoteParticipants.values;
+    for (final participant in participants ?? const <RemoteParticipant>[]) {
+      for (final publication in participant.audioTrackPublications) {
+        unawaited(_applySpeakerGain(publication.track));
+      }
+    }
+  }
+
   bool get _isBackendAutoConnect =>
       widget.autoConnect && widget.participantToken?.trim().isNotEmpty == true;
 
   @override
   void initState() {
     super.initState();
+    _speakerGain.addListener(_applySpeakerGainToAll);
     _roomController.text = widget.initialRoomName ?? '';
     _nameController.text = widget.initialParticipantName ?? '';
     if (widget.initialRole?.toLowerCase() == _DemoRole.host.name) {
@@ -346,6 +371,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _roomNotifier.dispose();
     _preJoinRevision.dispose();
     _meetingRevision.dispose();
+    _speakerGain.removeListener(_applySpeakerGainToAll);
     super.dispose();
   }
 
@@ -480,7 +506,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _refreshParticipants();
       });
       listener.on<TrackUnpublishedEvent>((_) => _refreshParticipants());
-      listener.on<TrackSubscribedEvent>((_) {
+      listener.on<TrackSubscribedEvent>((event) {
+        unawaited(_applySpeakerGain(event.track));
         if (mounted) _refreshMeeting();
       });
       listener.on<TrackUnsubscribedEvent>((_) {
@@ -2783,6 +2810,36 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                     });
                   },
                 ),
+              const Divider(color: Colors.white12, height: 1),
+              ValueListenableBuilder<double>(
+                valueListenable: _speakerGain,
+                builder: (context, gain, _) => ListTile(
+                  leading: const Icon(
+                    Icons.volume_up_rounded,
+                    color: Color(0xFF80CFFF),
+                  ),
+                  title: const Text(
+                    'Âm lượng người nói',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  trailing: Text(
+                    '${(gain * 100).round()}%',
+                    style: const TextStyle(
+                      color: Color(0xFF80CFFF),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  subtitle: Slider(
+                    value: gain,
+                    min: 1,
+                    max: 5,
+                    divisions: 8,
+                    activeColor: const Color(0xFF43B5FF),
+                    inactiveColor: Colors.white24,
+                    onChanged: (value) => _speakerGain.value = value,
+                  ),
+                ),
+              ),
               if (microphoneRouter != null && microphones.length > 1) ...[
                 const Divider(color: Colors.white12, height: 1),
                 const ListTile(
