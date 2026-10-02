@@ -93,4 +93,21 @@ void main() {
     await router.apply(reselect: true);
     expect(selected, isEmpty);
   });
+
+  test('knows when the mic in use is not the phone', () async {
+    await router.apply();
+    expect(router.usesExternalInput, isFalse);
+
+    inputs.add(mic('usb-rx', 'usb'));
+    await router.apply();
+    expect(router.usesExternalInput, isTrue);
+  });
+
+  test('a new built-in mic id once recording starts is not re-routed', () async {
+    await router.apply();
+    inputs = [mic('built-in-front', 'MicrophoneBuiltIn')];
+    await router.apply(reselect: true);
+    expect(selected, isEmpty);
+    expect(router.selectedId, 'built-in-front');
+  });
 }

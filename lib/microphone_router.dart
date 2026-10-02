@@ -40,6 +40,17 @@ class MicrophoneRouter extends ChangeNotifier {
   List<MediaDevice> get inputs => _inputs;
   String? get selectedId => _selectedId;
 
+  /// Whether the chosen mic is not the phone's own, so it does not sit next
+  /// to the phone's speaker.
+  bool get usesExternalInput {
+    for (final device in _inputs) {
+      if (device.deviceId == _selectedId) {
+        return kindOf(device) != MicrophoneKind.builtIn;
+      }
+    }
+    return false;
+  }
+
   static bool get _supported =>
       !kIsWeb &&
       (defaultTargetPlatform == TargetPlatform.iOS ||
@@ -84,6 +95,7 @@ class MicrophoneRouter extends ChangeNotifier {
   Future<void> _apply({required bool reselect}) async {
     if (!_supported || _disposed) return;
     try {
+      final wasExternal = usesExternalInput;
       final inputs = await _listInputs();
       if (_disposed) return;
       _inputs = inputs;
@@ -92,9 +104,11 @@ class MicrophoneRouter extends ChangeNotifier {
           target != null && kindOf(target) != MicrophoneKind.builtIn;
       if (target != null &&
           (target.deviceId != _selectedId || (reselect && external))) {
-        // The OS already records from the built-in mic by default.
+        // The OS already records from the built-in mic by default. Its id can
+        // change once recording starts; re-selecting it then moved the route
+        // while the engine was starting and could leave the new mic silent.
         final needsSwitch =
-            _selectedId != null ||
+            wasExternal ||
             _manualId != null ||
             kindOf(target) != MicrophoneKind.builtIn;
         if (needsSwitch) {
