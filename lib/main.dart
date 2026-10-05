@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
 import 'package:livekit_client/livekit_client.dart';
 
 // LiveKit 2.13.0 does not export its broadcast controls from the main library.
@@ -131,12 +132,58 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   static bool _isLandscape(BuildContext context) =>
       MediaQuery.orientationOf(context) == Orientation.landscape;
 
+  /// Gain on everyone else's voice; WebRTC accepts 0–10 and limits peaks
+  /// after mixing. Phones play calls through the quieter voice-processing
+  /// path, where unity gain sounded too soft. Kept while the app runs.
+  static final _speakerGain = ValueNotifier<double>(3.0);
+
+  /// The most the boost reaches while the phone's own mic is open. That mic
+  /// sits next to the speaker: at 300% the voices came back into it as echo,
+  /// and the echo canceller then cut the speaker's own voice. An external
+  /// mic or a headset is far enough from the speaker for the full boost.
+  static const _openPhoneMicGain = 1.5;
+
+  bool _openingMic = false;
+  double? _appliedGain;
+
+  double get _remoteGain {
+    final gain = _speakerGain.value;
+    final phoneMicOpen =
+        (_openingMic || _micEnabled) &&
+        !(_microphoneRouter?.usesExternalInput ?? false);
+    return phoneMicOpen && gain > _openPhoneMicGain ? _openPhoneMicGain : gain;
+  }
+
+  Future<void> _applySpeakerGain(Track? track) async {
+    if (track is! RemoteAudioTrack) return;
+    try {
+      await rtc.Helper.setVolume(_remoteGain, track.mediaStreamTrack);
+    } catch (error) {
+      debugPrint('[Hisale Coaching Hub] Could not set speaker volume: $error');
+    }
+  }
+
+  /// Re-applies the gain when the slider, the mic state or the mic in use
+  /// changes it.
+  void _syncSpeakerGain() {
+    final gain = _remoteGain;
+    if (gain == _appliedGain) return;
+    _appliedGain = gain;
+    final participants = _room?.remoteParticipants.values;
+    for (final participant in participants ?? const <RemoteParticipant>[]) {
+      for (final publication in participant.audioTrackPublications) {
+        unawaited(_applySpeakerGain(publication.track));
+      }
+    }
+  }
+
   bool get _isBackendAutoConnect =>
       widget.autoConnect && widget.participantToken?.trim().isNotEmpty == true;
 
   @override
   void initState() {
     super.initState();
+    _speakerGain.addListener(_syncSpeakerGain);
     _roomController.text = widget.initialRoomName ?? '';
     _nameController.text = widget.initialParticipantName ?? '';
     if (widget.initialRole?.toLowerCase() == _DemoRole.host.name) {
@@ -261,6 +308,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
 
   void _refreshParticipants() {
     if (!mounted || _room == null) return;
+    _syncSpeakerGain();
     final host = _hostParticipant;
     if (host != null) _knownHostIdentity = host.identity;
     // Room events can arrive while no Flutter frame is scheduled (for example,
@@ -346,6 +394,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _roomNotifier.dispose();
     _preJoinRevision.dispose();
     _meetingRevision.dispose();
+    _speakerGain.removeListener(_syncSpeakerGain);
     super.dispose();
   }
 
@@ -480,7 +529,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _refreshParticipants();
       });
       listener.on<TrackUnpublishedEvent>((_) => _refreshParticipants());
-      listener.on<TrackSubscribedEvent>((_) {
+      listener.on<TrackSubscribedEvent>((event) {
+        unawaited(_applySpeakerGain(event.track));
         if (mounted) _refreshMeeting();
       });
       listener.on<TrackUnsubscribedEvent>((_) {
@@ -518,7 +568,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _connectedRoomName = roomName;
       _screenShare = ScreenShareController.forRoom(room)
         ..addListener(_onScreenShareChanged);
-      _microphoneRouter = MicrophoneRouter();
+      // The full boost is safe with a mic away from the phone's speaker.
+      _microphoneRouter = MicrophoneRouter()..addListener(_syncSpeakerGain);
       unawaited(_microphoneRouter!.apply());
       _listener = listener;
       _chat = chat..addListener(_refreshChat);
@@ -648,6 +699,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _room = null;
     _chat = null;
     _announcedNames.clear();
+    _appliedGain = null;
+    _openingMic = false;
     _connectedRoomName = null;
     _knownHostIdentity = null;
     _connectedRole = null;
@@ -1609,6 +1662,34 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     }
   }
 
+  /// The first mic publication starts recording on an audio engine that was
+  /// playout-only, and the input route can still be settling. That capture
+  /// was sometimes silent until the user turned the mic off and on again.
+  /// Restart the new track once, as that toggle does, after the route settles.
+  Future<void> _refreshFirstMicCapture(Room room) async {
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    final local = room.localParticipant;
+    final publication = local?.getTrackPublicationBySource(
+      TrackSource.microphone,
+    );
+    final track = publication?.track;
+    if (!mounted ||
+        _room != room ||
+        local == null ||
+        !local.isMicrophoneEnabled() ||
+        publication == null ||
+        publication.muted ||
+        track is! LocalAudioTrack) {
+      return;
+    }
+    try {
+      await track.restartTrack();
+      debugPrint('[Hisale Coaching Hub] First microphone capture restarted.');
+    } catch (error) {
+      debugPrint('[Hisale Coaching Hub] First mic restart failed: $error');
+    }
+  }
+
   Future<void> _toggleMic() async {
     if (!_micEnabled && !_canUseMicrophone) {
       _showMediaError('Bạn cần giơ tay và chờ chủ phòng duyệt quyền bật mic.');
@@ -1700,10 +1781,20 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       }
       if (!mounted || _room != room) return;
       if (microphone) {
+        if (enabled) {
+          // Lower boosted voices before the mic opens, not after its first
+          // words were already met by them.
+          _openingMic = true;
+          _syncSpeakerGain();
+        }
+        final hadMicTrack =
+            local.getTrackPublicationBySource(TrackSource.microphone)?.track !=
+            null;
         await local.setMicrophoneEnabled(enabled);
         // iOS may list external inputs only once the session records, and
         // starting to record can move the route back to the phone's mic.
         if (enabled) await _microphoneRouter?.apply(reselect: true);
+        if (enabled && !hadMicTrack) await _refreshFirstMicCapture(room!);
       } else {
         if (enabled) {
           // LiveKit keeps a muted camera publication and restarts it with its
@@ -1735,6 +1826,11 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       if (mounted && _room == room) {
         _changingMic = false;
         _changingCamera = false;
+        if (microphone) {
+          // Also undoes the early switch when the mic failed to open.
+          _openingMic = false;
+          _syncSpeakerGain();
+        }
         _refreshMeeting();
       }
     }
@@ -2783,6 +2879,46 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                     });
                   },
                 ),
+              const Divider(color: Colors.white12, height: 1),
+              ValueListenableBuilder<double>(
+                valueListenable: _speakerGain,
+                builder: (context, gain, _) => ListTile(
+                  leading: const Icon(
+                    Icons.volume_up_rounded,
+                    color: Color(0xFF80CFFF),
+                  ),
+                  title: const Text(
+                    'Âm lượng người nói',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                  trailing: Text(
+                    '${(gain * 100).round()}%',
+                    style: const TextStyle(
+                      color: Color(0xFF80CFFF),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Slider(
+                        value: gain,
+                        min: 1,
+                        max: 5,
+                        divisions: 8,
+                        activeColor: const Color(0xFF43B5FF),
+                        inactiveColor: Colors.white24,
+                        onChanged: (value) => _speakerGain.value = value,
+                        padding: EdgeInsets.zero,
+                      ),
+                      const Text(
+                        'Khi bật mic của điện thoại, tối đa 150% để không bị vọng. Dùng mic rời hoặc tai nghe thì không giới hạn.',
+                        style: TextStyle(color: Colors.white54, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
               if (microphoneRouter != null && microphones.length > 1) ...[
                 const Divider(color: Colors.white12, height: 1),
                 const ListTile(
