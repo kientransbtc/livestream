@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart' hide ConnectionState;
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
 import 'package:livekit_client/livekit_client.dart';
 
 import 'media_access.dart';
@@ -11,6 +13,18 @@ const livestreamChatTopic = 'hisale.livestream.chat';
 const livestreamControlTopic = 'hisale.livestream.control';
 const _endedSignal = 'ended';
 const livestreamChatMaxCharacters = 500;
+const livestreamReactionTopic = 'hisale.livestream.reaction';
+
+/// Viewer-side boost on the host's voice. WebRTC accepts 0–10, but past 3x
+/// the limiter starts squashing loud syllables and the voice turns harsh.
+/// Viewers never open their mic, so the boost cannot echo back.
+const livestreamMinSpeakerGain = 1.0;
+const livestreamMaxSpeakerGain = 3.0;
+
+/// Taps each participant gets per reaction in one broadcast.
+const livestreamReactionLimit = 5;
+
+enum LivestreamReaction { heart, like }
 
 /// A chat line seen during this connection. LiveKit forwards new messages
 /// only, so nothing is kept after leaving the room.
@@ -22,12 +36,17 @@ class LivestreamChatMessage {
     required this.text,
     required this.sentAt,
     this.isOwn = false,
+    this.isHost = false,
   });
   final String id;
   final String senderName;
   final String text;
   final DateTime sentAt;
   final bool isOwn;
+
+  /// Sent by the broadcaster, judged by room identity and never by what the
+  /// sender claims.
+  final bool isHost;
 }
 
 /// The broadcast media path and its chat, both over the LiveKit room.
@@ -40,6 +59,18 @@ class LivestreamMediaController extends ChangeNotifier {
 
   /// Called once the host ends the broadcast or the server deletes the room.
   void Function()? onEnded;
+
+  /// Called for every reaction another participant sends, at most
+  /// [livestreamReactionLimit] per sender and kind.
+  void Function(LivestreamReaction reaction)? onReaction;
+
+  /// The name shown on this device's chat. It travels with every message
+  /// because the backend's LiveKit name can be empty or an id.
+  String? displayName;
+
+  /// Reactions counted per `identity/kind` so a modified client cannot
+  /// flood everyone's screen.
+  final _reactionsBySender = <String, int>{};
 
   Room? _room;
   EventsListener<RoomEvent>? _listener;
@@ -63,23 +94,49 @@ class LivestreamMediaController extends ChangeNotifier {
       _room?.localParticipant?.isMicrophoneEnabled() ?? false;
   bool get cameraEnabled => _room?.localParticipant?.isCameraEnabled() ?? false;
 
-  /// People watching, excluding the host.
+  /// Everyone in the room, the host and this device included.
   int get viewerCount {
     final room = _room;
     if (room == null || !connected) return 0;
-    final everyone = room.remoteParticipants.length + 1;
-    final hostPresent =
-        _host || room.remoteParticipants.containsKey(_hostIdentity);
-    return hostPresent ? everyone - 1 : everyone;
+    return room.remoteParticipants.length + 1;
   }
 
-  String? get microphoneName {
-    final router = _microphones;
-    if (router == null) return null;
-    for (final device in router.inputs) {
-      if (device.deviceId == router.selectedId) return device.label;
+  /// Kept while the app runs so every broadcast opens at the chosen level.
+  static double _speakerGain = 2.0;
+  double get speakerGain => _speakerGain;
+
+  Future<void> setSpeakerGain(double gain) async {
+    _speakerGain = gain.clamp(
+      livestreamMinSpeakerGain,
+      livestreamMaxSpeakerGain,
+    );
+    _changed();
+    final participants = _room?.remoteParticipants.values;
+    for (final participant in participants ?? const <RemoteParticipant>[]) {
+      for (final publication in participant.audioTrackPublications) {
+        await _applySpeakerGain(publication.track);
+      }
     }
-    return null;
+  }
+
+  Future<void> _applySpeakerGain(Track? track) async {
+    if (track is! RemoteAudioTrack) return;
+    try {
+      await rtc.Helper.setVolume(_speakerGain, track.mediaStreamTrack);
+    } catch (error) {
+      debugPrint('[HiSale Livestream] Could not set speaker volume: $error');
+    }
+  }
+
+  /// The broadcaster's name as the room knows it, once it is present.
+  String? get hostName {
+    final room = _room;
+    if (room == null) return null;
+    final name = _host
+        ? (displayName ?? room.localParticipant?.name)
+        : room.remoteParticipants[_currentHostIdentity]?.name;
+    final value = name?.trim() ?? '';
+    return value.isEmpty ? null : value;
   }
 
   void _changed() {
@@ -103,10 +160,13 @@ class LivestreamMediaController extends ChangeNotifier {
     return next;
   }
 
+  /// [hostIdentity] may be null while rooms come from the meeting API, which
+  /// does not say who broadcasts: the host then announces itself through its
+  /// metadata and viewers follow whoever does (or whoever shows a camera).
   Future<void> connect({
     required String serverUrl,
     required String token,
-    required String hostIdentity,
+    required String? hostIdentity,
     required bool isHost,
   }) => _serialize(() async {
     await _tearDown();
@@ -118,6 +178,24 @@ class LivestreamMediaController extends ChangeNotifier {
       roomOptions: const RoomOptions(
         adaptiveStream: true,
         dynacast: true,
+        // Same voice processing as the meeting: echo cancellation, noise
+        // suppression and voice isolation clean the room; the high-pass
+        // filter (off by default) drops rumble and hum; AGC keeps the level
+        // steady so loud speech does not clip.
+        defaultAudioCaptureOptions: AudioCaptureOptions(
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          highPassFilter: true,
+          voiceIsolation: true,
+        ),
+        // A broadcast is listened to closely: the music preset (48 kbps)
+        // keeps the voice clear, and without DTX quiet passages are not
+        // replaced by comfort noise that sounds like crackle.
+        defaultAudioPublishOptions: AudioPublishOptions(
+          encoding: AudioEncoding.presetMusic,
+          dtx: false,
+        ),
         defaultCameraCaptureOptions: CameraCaptureOptions(
           params: VideoParametersPresets.h720_169,
         ),
@@ -132,13 +210,17 @@ class LivestreamMediaController extends ChangeNotifier {
       })
       ..on<ParticipantConnectedEvent>((_) => _changed())
       ..on<ParticipantDisconnectedEvent>((_) => _changed())
+      ..on<ParticipantMetadataUpdatedEvent>((_) => _changed())
       ..on<RoomReconnectingEvent>((_) => _changed())
       ..on<RoomReconnectedEvent>((_) {
         connectionError = null;
         if (_host) unawaited(_microphones?.apply(reselect: true));
         _changed();
       })
-      ..on<TrackSubscribedEvent>((_) => _changed())
+      ..on<TrackSubscribedEvent>((event) {
+        unawaited(_applySpeakerGain(event.track));
+        _changed();
+      })
       ..on<TrackUnsubscribedEvent>((_) => _changed())
       ..on<TrackMutedEvent>((_) => _changed())
       ..on<TrackUnmutedEvent>((_) => _changed())
@@ -151,6 +233,10 @@ class LivestreamMediaController extends ChangeNotifier {
     room.registerTextStreamHandler(livestreamControlTopic, (reader, identity) {
       unawaited(_receiveControl(reader, identity));
     });
+    _reactionsBySender.clear();
+    room.registerTextStreamHandler(livestreamReactionTopic, (reader, identity) {
+      unawaited(_receiveReaction(room, reader, identity));
+    });
     try {
       await MeetingAudioSession.acquire();
       _holdsAudioSession = true;
@@ -162,9 +248,18 @@ class LivestreamMediaController extends ChangeNotifier {
           !local.permissions.canSubscribe ||
           (isHost &&
               (!local.permissions.canPublish ||
-                  local.identity != hostIdentity)) ||
-          (!isHost && local.permissions.canPublish)) {
+                  hostIdentity != null && local.identity != hostIdentity)) ||
+          // Meeting tokens let everyone publish; only a viewer never does.
+          (!isHost && hostIdentity != null && local.permissions.canPublish)) {
         throw StateError('Quyền kết nối livestream không hợp lệ.');
+      }
+      if (isHost && hostIdentity == null) {
+        _hostIdentity = local.identity;
+        try {
+          await local.setMetadata(jsonEncode({'role': 'host'}));
+        } catch (_) {
+          // Viewers still find the host by its camera.
+        }
       }
       if (isHost) {
         _microphones = MicrophoneRouter()..addListener(_changed);
@@ -191,13 +286,17 @@ class LivestreamMediaController extends ChangeNotifier {
     try {
       final text = (await reader.readAll()).trim();
       if (text.isEmpty || _room != room || _closed) return;
-      final name = room.remoteParticipants[identity]?.name.trim();
       onMessage?.call(
         LivestreamChatMessage(
           id:
               reader.info?.id ??
               '$identity-${DateTime.now().microsecondsSinceEpoch}',
-          senderName: name?.isNotEmpty == true ? name! : 'Người xem',
+          senderName: _senderName(
+            reader.info?.attributes[_nameAttribute],
+            room.remoteParticipants[identity]?.name,
+            identity,
+          ),
+          isHost: identity == _currentHostIdentity,
           text: text.characters.take(livestreamChatMaxCharacters).toString(),
           sentAt: _sentAt(reader.info?.timestamp ?? 0),
         ),
@@ -211,7 +310,9 @@ class LivestreamMediaController extends ChangeNotifier {
     try {
       final signal = await reader.readAll();
       // Only the host can end the broadcast for everyone.
-      if (signal == _endedSignal && identity == _hostIdentity) _notifyEnded();
+      if (signal == _endedSignal && identity == _currentHostIdentity) {
+        _notifyEnded();
+      }
     } catch (_) {}
   }
 
@@ -220,24 +321,71 @@ class LivestreamMediaController extends ChangeNotifier {
       ? DateTime.now()
       : DateTime.fromMillisecondsSinceEpoch(milliseconds);
 
+  Future<void> _receiveReaction(
+    Room room,
+    TextStreamReader reader,
+    String identity,
+  ) async {
+    try {
+      final name = (await reader.readAll()).trim();
+      if (_room != room || _closed) return;
+      final reaction = LivestreamReaction.values
+          .where((value) => value.name == name)
+          .firstOrNull;
+      if (reaction == null) return;
+      final key = '$identity/${reaction.name}';
+      final count = _reactionsBySender[key] ?? 0;
+      if (count >= livestreamReactionLimit) return;
+      _reactionsBySender[key] = count + 1;
+      onReaction?.call(reaction);
+    } catch (_) {}
+  }
+
+  Future<void> sendReaction(LivestreamReaction reaction) async {
+    _checkOpen();
+    final local = _room?.localParticipant;
+    if (!connected || local == null || !local.permissions.canPublishData) {
+      throw StateError('Chưa kết nối livestream. Hãy thử lại.');
+    }
+    await local.sendText(
+      reaction.name,
+      options: SendTextOptions(topic: livestreamReactionTopic),
+    );
+  }
+
   Future<LivestreamChatMessage> sendChat(String text) async {
     _checkOpen();
     final local = _room?.localParticipant;
     if (!connected || local == null || !local.permissions.canPublishData) {
       throw StateError('Chat chưa kết nối. Hãy thử lại.');
     }
+    final name = _senderName(displayName, local.name, local.identity);
     final info = await local.sendText(
       text,
-      options: SendTextOptions(topic: livestreamChatTopic),
+      options: SendTextOptions(
+        topic: livestreamChatTopic,
+        attributes: {_nameAttribute: name},
+      ),
     );
-    final name = local.name.trim();
     return LivestreamChatMessage(
       id: info.id,
-      senderName: name.isNotEmpty ? name : 'Bạn',
+      senderName: name,
       text: text,
       sentAt: _sentAt(info.timestamp),
       isOwn: true,
+      isHost: _host,
     );
+  }
+
+  static const _nameAttribute = 'name';
+
+  /// Like the meeting: the announced name, then LiveKit's, then the identity.
+  static String _senderName(String? announced, String? liveKit, String id) {
+    for (final value in [announced, liveKit, id]) {
+      final name = value?.trim() ?? '';
+      if (name.isNotEmpty) return name.characters.take(60).toString();
+    }
+    return 'Người xem';
   }
 
   /// Tells viewers the host ended the broadcast. Best effort: viewers also
@@ -332,12 +480,39 @@ class LivestreamMediaController extends ChangeNotifier {
     _changed();
   });
 
+  String? get _currentHostIdentity {
+    final known = _hostIdentity;
+    final room = _room;
+    if (known != null || room == null) return known;
+    final remotes = room.remoteParticipants.values;
+    for (final participant in remotes) {
+      if (_role(participant) == 'host') return participant.identity;
+    }
+    for (final participant in remotes) {
+      if (participant.videoTrackPublications.any(
+        (publication) => publication.source == TrackSource.camera,
+      )) {
+        return participant.identity;
+      }
+    }
+    return null;
+  }
+
+  static String? _role(Participant participant) {
+    try {
+      final value = jsonDecode(participant.metadata ?? '');
+      return value is Map ? value['role']?.toString() : null;
+    } on FormatException {
+      return null;
+    }
+  }
+
   VideoTrack? get _videoTrack {
     final room = _room;
     if (room == null) return null;
     final Participant? host = _host
         ? room.localParticipant
-        : room.remoteParticipants[_hostIdentity];
+        : room.remoteParticipants[_currentHostIdentity];
     if (host == null) return null;
     for (final publication in host.videoTrackPublications) {
       if (publication.source == TrackSource.camera && !publication.muted) {
@@ -358,6 +533,7 @@ class LivestreamMediaController extends ChangeNotifier {
     room?.removeListener(_changed);
     room?.unregisterTextStreamHandler(livestreamChatTopic);
     room?.unregisterTextStreamHandler(livestreamControlTopic);
+    room?.unregisterTextStreamHandler(livestreamReactionTopic);
     try {
       await room?.dispose();
     } finally {
@@ -387,9 +563,13 @@ class LivestreamVideo extends StatelessWidget {
     super.key,
     required this.controller,
     required this.placeholder,
+    this.fit = VideoViewFit.contain,
   });
   final LivestreamMediaController controller;
   final Widget placeholder;
+
+  /// Cover fills the screen edge to edge, as on TikTok.
+  final VideoViewFit fit;
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
@@ -400,7 +580,7 @@ class LivestreamVideo extends StatelessWidget {
           ? placeholder
           : VideoTrackRenderer(
               track,
-              fit: VideoViewFit.contain,
+              fit: fit,
               mirrorMode:
                   controller._host &&
                       controller._cameraPosition == CameraPosition.front
