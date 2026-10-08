@@ -15,6 +15,13 @@ analyzer:
   exclude:
     - third_party/livekit_client/example/**
     - third_party/livekit_client/test/**
+    - build/**
+    - android/**
+    - ios/**
+    - web/**
+    - windows/**
+    - macos/**
+    - linux/**
 
 linter:
   # The lint rules applied to this project can be customized in the
