@@ -242,16 +242,32 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       final aClaiming = _participantMetadata(a)['host_state'] == 'claiming';
       final bClaiming = _participantMetadata(b)['host_state'] == 'claiming';
       if (aClaiming != bClaiming) return aClaiming ? 1 : -1;
-      final joinedOrder = a.joinedAt.compareTo(b.joinedAt);
-      return joinedOrder != 0 ? joinedOrder : a.identity.compareTo(b.identity);
+      return _byJoinOrder(a, b);
     });
     return candidates.firstOrNull;
+  }
+
+  /// Hosts who joined while another host held the room wait as members. When
+  /// the room has no host left, the one that joined first takes it back.
+  Participant? get _hostSuccessor {
+    final local = _room?.localParticipant;
+    final candidates = _participants.where((participant) {
+      if (participant == local) return _role == _DemoRole.host;
+      return _participantMetadata(participant)['host_eligible'] == true;
+    }).toList()..sort(_byJoinOrder);
+    return candidates.firstOrNull;
+  }
+
+  static int _byJoinOrder(Participant a, Participant b) {
+    final joinedOrder = a.joinedAt.compareTo(b.joinedAt);
+    return joinedOrder != 0 ? joinedOrder : a.identity.compareTo(b.identity);
   }
 
   Future<void> _resolveHost() async {
     final room = _room;
     final local = room?.localParticipant;
-    if (room == null || local == null || !_isHost || _resolvingHost) return;
+    if (room == null || local == null || _resolvingHost) return;
+    if (!_isHost) return _takeOverHost(room, local);
     final host = _hostParticipant;
     if (host == null) return;
     _resolvingHost = true;
@@ -267,7 +283,10 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
             'Phòng đã có host. Bạn chỉ tham gia với tư cách thành viên.';
         _refreshMeeting();
         await local.setMicrophoneEnabled(false);
-        await local.setMetadata(jsonEncode({'role': 'audience'}));
+        // Others read the flag to hand the room back when the host leaves.
+        await local.setMetadata(
+          jsonEncode({'role': 'audience', 'host_eligible': true}),
+        );
       } else if (_participantMetadata(local)['host_state'] == 'claiming') {
         acted = true;
         await local.setMetadata(
@@ -289,6 +308,36 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         if (_isHost && _hostParticipant?.identity != local.identity) {
           unawaited(_resolveHost());
         }
+      }
+    }
+  }
+
+  /// Every client picks the same successor, so only one claims the room. If
+  /// two still claim at once, [_resolveHost] keeps the earlier join.
+  Future<void> _takeOverHost(Room room, LocalParticipant local) async {
+    if (_role != _DemoRole.host || _hostParticipant != null) return;
+    if (_hostSuccessor?.identity != local.identity) return;
+    _resolvingHost = true;
+    try {
+      _connectedRole = _DemoRole.host;
+      _handRaised = false;
+      _hostNotice = 'Host trước đã rời phòng. Bạn đã trở thành host.';
+      _refreshMeeting();
+      await local.setMetadata(
+        jsonEncode({'role': 'host', 'host_state': 'active'}),
+      );
+    } catch (_) {
+      if (_room == room) {
+        await _disconnect(
+          message:
+              'Chưa đồng bộ được vai trò trong phòng. Bấm Vào phòng để thử lại.',
+        );
+      }
+    } finally {
+      _resolvingHost = false;
+      if (mounted && _room == room) {
+        _refreshMeeting();
+        unawaited(_resolveHost());
       }
     }
   }
