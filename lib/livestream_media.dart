@@ -175,7 +175,7 @@ class LivestreamMediaController extends ChangeNotifier {
     _hostIdentity = hostIdentity;
     connectionError = null;
     final room = Room(
-      roomOptions: const RoomOptions(
+      roomOptions: RoomOptions(
         adaptiveStream: true,
         dynacast: true,
         // Same voice processing as the meeting: echo cancellation, noise
@@ -199,6 +199,7 @@ class LivestreamMediaController extends ChangeNotifier {
         defaultCameraCaptureOptions: CameraCaptureOptions(
           params: VideoParametersPresets.h720_169,
         ),
+        defaultVideoPublishOptions: cameraPublishOptions,
       ),
     );
     _room = room;

@@ -1,9 +1,22 @@
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:livekit_client/livekit_client.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 enum MeetingMedia { microphone, camera }
+
+/// Camera publish settings for meetings and livestreams.
+///
+/// LiveKit's camera default keeps the frame rate and drops the resolution
+/// whenever the phone's CPU or uplink is strained, and WebRTC rarely scales it
+/// back up: the picture starts sharp, then blurs as the phone heats up over a
+/// long session. Keep the resolution and let the frame rate give instead. iOS
+/// encodes H.264 in hardware (VP8 is software), so it runs much cooler.
+VideoPublishOptions get cameraPublishOptions => VideoPublishOptions(
+  videoCodec: defaultTargetPlatform == TargetPlatform.iOS ? 'h264' : 'vp8',
+  degradationPreference: DegradationPreference.maintainResolution,
+);
 
 enum MediaAccessResult { granted, denied, blocked, restricted, simulatorCamera }
 

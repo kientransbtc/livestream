@@ -115,6 +115,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   final Set<String> _waitingIdentities = <String>{};
   final Set<_MemberMedia> _openHostInvites = <_MemberMedia>{};
   bool _holdsAudioSession = false;
+  DateTime? _weakNetworkWarnedAt;
 
   // Names members announce over the control channel. The backend's LiveKit
   // name can carry an id, and not every token lets a member rename itself.
@@ -496,7 +497,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           ? widget.serverUrl!.trim()
           : liveKitDemoUrl;
       final room = Room(
-        roomOptions: const RoomOptions(
+        roomOptions: RoomOptions(
           adaptiveStream: true,
           dynacast: true,
           // Voice processing runs before screen-share audio is mixed in, so it
@@ -512,6 +513,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           defaultCameraCaptureOptions: CameraCaptureOptions(
             cameraPosition: CameraPosition.front,
           ),
+          defaultVideoPublishOptions: cameraPublishOptions,
           defaultScreenShareCaptureOptions: ScreenShareCaptureOptions(
             useiOSBroadcastExtension: true,
             maxFrameRate: 30,
@@ -591,6 +593,11 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       });
       listener.on<LocalTrackUnpublishedEvent>((_) {
         _refreshParticipants();
+      });
+      listener.on<ParticipantConnectionQualityUpdatedEvent>((event) {
+        if (event.participant is LocalParticipant) {
+          _warnWeakNetwork(event.connectionQuality);
+        }
       });
       // Before connecting, so remote audio never starts in LiveKit's
       // listen-only session.
@@ -753,6 +760,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _connectedRoomName = null;
     _knownHostIdentity = null;
     _connectedRole = null;
+    _weakNetworkWarnedAt = null;
     // Notify LiveKit immediately. Waiting for a pending screen-share operation
     // first can delay the server's participant-disconnected event by seconds.
     final disconnection = room?.disconnect();
@@ -794,6 +802,26 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _connecting = false;
       _refreshPreJoin();
     }
+  }
+
+  /// The camera keeps its resolution, so a weak uplink shows as stutter for
+  /// everyone watching. Only the presenter can fix that, so tell them, but no
+  /// more than once a minute.
+  void _warnWeakNetwork(ConnectionQuality quality) {
+    if (quality != ConnectionQuality.poor &&
+        quality != ConnectionQuality.lost) {
+      return;
+    }
+    if (!mounted || _room == null || !_cameraEnabled) return;
+    final warnedAt = _weakNetworkWarnedAt;
+    if (warnedAt != null &&
+        DateTime.now().difference(warnedAt) < const Duration(minutes: 1)) {
+      return;
+    }
+    _weakNetworkWarnedAt = DateTime.now();
+    _showMediaError(
+      'Mạng của bạn đang yếu, mọi người có thể thấy hình bị giật. Hãy chuyển sang Wi-Fi hoặc 4G mạnh hơn.',
+    );
   }
 
   Future<void> _exitApplication() async {
