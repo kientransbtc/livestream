@@ -114,6 +114,44 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   String? _error;
   final Set<String> _waitingIdentities = <String>{};
   final Set<_MemberMedia> _openHostInvites = <_MemberMedia>{};
+
+  // Waiting room. The host's metadata carries `lobby`; while it is on, a
+  // member who was not already inside waits, subscribed to nothing, until
+  // the host lets them in.
+  // ponytail: enforced by the clients only, like hand raising. The backend
+  // should mint waiting members a canSubscribe=false token and grant it on
+  // admission (UpdateParticipant) so a modified client cannot watch.
+  // Rooms whose host turned the waiting room on, kept for the app run so a
+  // host who rejoins does not open the doors by accident.
+  static final _lobbyRooms = <String>{};
+  bool _lobbyEnabled = false;
+  bool _knownLobby = false;
+  bool _admitted = false;
+  String? _joinRequestedFrom;
+  final Set<String> _joinRequests = <String>{};
+
+  bool get _inLobby => _role != _DemoRole.host && !_admitted && _knownLobby;
+
+  // The host's pin rides in its metadata, so members who join later see it
+  // too. A member may stop following it; a new pin shows again.
+  String? _pinnedIdentity;
+  String? _dismissedPin;
+  String? _seenPin;
+
+  String? get _roomPin {
+    if (_isHost) return _pinnedIdentity;
+    final host = _hostParticipant;
+    final pin = host == null ? null : _participantMetadata(host)['pinned'];
+    return pin is String ? pin : null;
+  }
+
+  /// The pinned participant this viewer follows, while they are in the room.
+  Participant? get _pinnedParticipant {
+    final pin = _roomPin;
+    if (pin == null || pin == _dismissedPin) return null;
+    return _participants.where((p) => p.identity == pin).firstOrNull;
+  }
+
   bool _holdsAudioSession = false;
   DateTime? _weakNetworkWarnedAt;
 
@@ -290,9 +328,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         );
       } else if (_participantMetadata(local)['host_state'] == 'claiming') {
         acted = true;
-        await local.setMetadata(
-          jsonEncode({'role': 'host', 'host_state': 'active'}),
-        );
+        await local.setMetadata(_hostMetadata);
       }
     } catch (_) {
       if (_room == room) {
@@ -322,11 +358,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     try {
       _connectedRole = _DemoRole.host;
       _handRaised = false;
+      // Keep the previous host's waiting room and pin.
+      _lobbyEnabled = _knownLobby || _lobbyRooms.contains(_connectedRoomName);
+      _pinnedIdentity = _seenPin;
       _hostNotice = 'Host trước đã rời phòng. Bạn đã trở thành host.';
       _refreshMeeting();
-      await local.setMetadata(
-        jsonEncode({'role': 'host', 'host_state': 'active'}),
-      );
+      await local.setMetadata(_hostMetadata);
     } catch (_) {
       if (_room == room) {
         await _disconnect(
@@ -361,11 +398,136 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _syncSpeakerGain();
     final host = _hostParticipant;
     if (host != null) _knownHostIdentity = host.identity;
+    _followLobby();
+    final pin = _roomPin;
+    // While the room has no host the last pin is kept for whoever takes over.
+    if ((_isHost || host != null) && pin != _seenPin) {
+      _seenPin = pin;
+      _dismissedPin = null;
+      // A new pin takes the stage from whatever this viewer picked.
+      if (pin != null) _clearFocus();
+    }
     // Room events can arrive while no Flutter frame is scheduled (for example,
     // when a participant joins without publishing video). Notify the meeting
     // builder immediately, then reconcile focus and host state after this frame.
     _refreshMeeting();
     _scheduleRoomRefresh(resolveHost: true);
+  }
+
+  String get _hostMetadata => jsonEncode({
+    'role': 'host',
+    'host_state': 'active',
+    if (_lobbyEnabled) 'lobby': true,
+    if (_pinnedIdentity != null) 'pinned': _pinnedIdentity,
+  });
+
+  Future<void> _setPin(String? identity) async {
+    final local = _room?.localParticipant;
+    if (!_isHost || local == null) return;
+    final previous = _pinnedIdentity;
+    _pinnedIdentity = identity;
+    _clearFocus();
+    _refreshMeeting();
+    try {
+      await local.setMetadata(_hostMetadata);
+    } catch (_) {
+      if (!mounted || _room?.localParticipant != local) return;
+      _pinnedIdentity = previous;
+      _refreshMeeting();
+      _showMediaError('Chưa ghim được. Vui lòng thử lại.');
+    }
+  }
+
+  void _togglePin(Participant participant) {
+    final pinned = _pinnedIdentity == participant.identity;
+    unawaited(_setPin(pinned ? null : participant.identity));
+    _showMediaError(
+      pinned
+          ? 'Đã bỏ ghim. Màn hình chính trở về mặc định.'
+          : 'Đã ghim ${_participantDisplayName(participant)} lên màn hình chính của cả phòng.',
+    );
+  }
+
+  /// Follows the host's waiting room. A host still claiming the room has
+  /// not published it yet. Hosts waiting as members follow it too, to keep
+  /// it if they take the room over, but never wait themselves.
+  void _followLobby() {
+    if (_isHost) return;
+    final host = _hostParticipant;
+    final wasInLobby = _inLobby;
+    final metadata = host == null ? null : _participantMetadata(host);
+    if (metadata != null && metadata['host_state'] != 'claiming') {
+      _knownLobby = metadata['lobby'] == true;
+      // Whoever is inside while the doors are open stays in.
+      if (!_knownLobby) _admitted = true;
+    }
+    if (_inLobby != wasInLobby) _syncSubscriptions();
+    // Asks each new host once: a host who joins later never saw the request.
+    if (_inLobby && host != null && _joinRequestedFrom != host.identity) {
+      unawaited(_requestToJoin(host.identity));
+    }
+  }
+
+  /// Members join with autoSubscribe off: nothing plays until they are in.
+  void _syncSubscriptions() {
+    if (_role == _DemoRole.host) return;
+    final participants = _room?.remoteParticipants.values;
+    for (final participant in participants ?? const <RemoteParticipant>[]) {
+      for (final publication in participant.trackPublications.values) {
+        unawaited(
+          _inLobby ? publication.unsubscribe() : publication.subscribe(),
+        );
+      }
+    }
+  }
+
+  Future<void> _requestToJoin(String hostIdentity) async {
+    _joinRequestedFrom = hostIdentity;
+    try {
+      await _send({'type': 'join_request'}, destination: hostIdentity);
+    } catch (_) {
+      // Asked again on the next room event.
+      if (_joinRequestedFrom == hostIdentity) _joinRequestedFrom = null;
+    }
+  }
+
+  Future<void> _setLobby(bool enabled) async {
+    final room = _room;
+    final local = room?.localParticipant;
+    final roomName = _connectedRoomName;
+    if (!_isHost || local == null || roomName == null) return;
+    void apply(bool value) {
+      _lobbyEnabled = value;
+      value ? _lobbyRooms.add(roomName) : _lobbyRooms.remove(roomName);
+      // Members read the flag off: everyone waiting gets in on their own.
+      if (!value) _joinRequests.clear();
+      _refreshMeeting();
+    }
+
+    apply(enabled);
+    try {
+      await local.setMetadata(_hostMetadata);
+    } catch (_) {
+      if (!mounted || _room != room) return;
+      apply(!enabled);
+      _showMediaError('Chưa đổi được phòng chờ. Vui lòng thử lại.');
+    }
+  }
+
+  Future<void> _answerJoin(String identity, {required bool admit}) async {
+    if (!_isHost || _room == null) return;
+    _joinRequests.remove(identity);
+    _refreshMeeting();
+    try {
+      await _send({
+        'type': admit ? 'join_admitted' : 'join_rejected',
+      }, destination: identity);
+    } catch (_) {
+      if (!mounted || _room == null) return;
+      _joinRequests.add(identity);
+      _refreshMeeting();
+      _showMediaError('Chưa gửi được. Vui lòng thử lại.');
+    }
   }
 
   void _scheduleRoomRefresh({required bool resolveHost}) {
@@ -384,7 +546,11 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _waitingIdentities.removeWhere(
         (identity) => !identities.contains(identity),
       );
-      var changed = _waitingIdentities.length != waiting;
+      final joining = _joinRequests.length;
+      _joinRequests.removeWhere((identity) => !identities.contains(identity));
+      var changed =
+          _waitingIdentities.length != waiting ||
+          _joinRequests.length != joining;
       if (_focusedIdentity != null && !identities.contains(_focusedIdentity)) {
         _focusedIdentity = null;
         _focusedScreen = false;
@@ -576,6 +742,9 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       listener.on<TrackMutedEvent>((_) => _refreshParticipants());
       listener.on<TrackUnmutedEvent>((_) => _refreshParticipants());
       listener.on<TrackPublishedEvent>((event) {
+        if (selectedRole != _DemoRole.host && !_inLobby) {
+          unawaited(event.publication.subscribe());
+        }
         _onScreenPublished(event.participant, event.publication.source);
         _refreshParticipants();
       });
@@ -603,11 +772,13 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       // listen-only session.
       await MeetingAudioSession.acquire();
       holdsAudioSession = true;
-      // Keep remote audio/video subscriptions enabled for incoming participants.
+      // Members subscribe themselves once the waiting room lets them in.
       await room.connect(
         serverUrl,
         token,
-        connectOptions: const ConnectOptions(autoSubscribe: true),
+        connectOptions: ConnectOptions(
+          autoSubscribe: selectedRole == _DemoRole.host,
+        ),
       );
       if (!mounted) {
         chat.dispose();
@@ -630,6 +801,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       _listener = listener;
       _chat = chat..addListener(_refreshChat);
       _connectedRole = selectedRole;
+      _lobbyEnabled =
+          selectedRole == _DemoRole.host && _lobbyRooms.contains(roomName);
+      // Nobody keeps the doors in an empty room.
+      if (_hostParticipant == null) _admitted = true;
+      _followLobby();
+      _syncSubscriptions();
       _roomNotifier.value = room;
       _syncLocalParticipantName(room);
       unawaited(_announceName());
@@ -643,6 +820,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         _showMediaError(_dataPermissionMissing);
       }
       await _resolveHost();
+      // A host whose token carries no claim never rewrote its metadata.
+      if (_isHost && _lobbyEnabled && _room == room) {
+        try {
+          await room.localParticipant!.setMetadata(_hostMetadata);
+        } catch (_) {}
+      }
       if (kDebugMode) {
         debugPrint(
           '[Hisale Coaching Hub] Joined as ${_isHost ? 'host' : 'member'}; '
@@ -761,6 +944,14 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     _knownHostIdentity = null;
     _connectedRole = null;
     _weakNetworkWarnedAt = null;
+    _lobbyEnabled = false;
+    _knownLobby = false;
+    _admitted = false;
+    _joinRequestedFrom = null;
+    _joinRequests.clear();
+    _pinnedIdentity = null;
+    _dismissedPin = null;
+    _seenPin = null;
     // Notify LiveKit immediately. Waiting for a pending screen-share operation
     // first can delay the server's participant-disconnected event by seconds.
     final disconnection = room?.disconnect();
@@ -1002,6 +1193,25 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
         unawaited(_announceName(identity: sender));
       }
       _announcedNames[sender] = name.trim().characters.take(60).toString();
+      _refreshMeeting();
+    } else if (type == 'join_request' && _isHost && sender != null) {
+      // A request sent just before the host opened the doors.
+      if (!_lobbyEnabled) {
+        unawaited(_answerJoin(sender, admit: true));
+        return;
+      }
+      _joinRequests.add(sender);
+      _refreshMeeting();
+    } else if ((type == 'join_admitted' || type == 'join_rejected') &&
+        _inLobby &&
+        sender == _hostParticipant?.identity) {
+      if (type == 'join_rejected') {
+        unawaited(_disconnect(message: 'Chủ phòng chưa cho bạn vào phòng.'));
+        return;
+      }
+      _admitted = true;
+      _hostNotice = 'Chủ phòng đã cho bạn vào phòng.';
+      _syncSubscriptions();
       _refreshMeeting();
     } else if (type == 'hand_raise' && _isHost && sender != null) {
       _waitingIdentities.add(sender);
@@ -2183,7 +2393,9 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Tên phòng: $_connectedRoomName',
+          widget.initialRoomTitle?.trim().isNotEmpty == true
+              ? widget.initialRoomTitle!.trim()
+              : (_connectedRoomName ?? ''),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
@@ -2221,9 +2433,62 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
             ),
           ),
         ),
-      ..._appBarActions(),
+      if (_isHost) _lobbyToggle(),
+      const SizedBox(width: 12),
     ],
   );
+
+  /// A pill that names the state it is in; the badge counts who waits.
+  Widget _lobbyToggle() {
+    final on = _lobbyEnabled;
+    return Badge(
+      isLabelVisible: _joinRequests.isNotEmpty,
+      label: Text('${_joinRequests.length}'),
+      offset: const Offset(-2, -4),
+      child: Material(
+        color: on ? const Color(0xFF168BE7) : const Color(0xFF2B2D34),
+        shape: StadiumBorder(
+          side: BorderSide(
+            color: on ? const Color(0xFF55B7FF) : Colors.white24,
+          ),
+        ),
+        child: InkWell(
+          customBorder: const StadiumBorder(),
+          onTap: () {
+            final enabled = !on;
+            unawaited(_setLobby(enabled));
+            _showMediaError(
+              enabled
+                  ? 'Đã bật duyệt vào phòng. Người mới vào phải chờ bạn cho vào.'
+                  : 'Đã tắt duyệt vào phòng. Mọi người vào xem tự do.',
+            );
+          },
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  on ? Icons.lock_rounded : Icons.lock_open_rounded,
+                  size: 16,
+                  color: Colors.white,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'Duyệt vào',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _buildPreJoin() {
     const blue = Color(0xFF168BE7);
@@ -2513,6 +2778,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     if (!mounted || _room == null || source != TrackSource.screenShareVideo) {
       return;
     }
+    // The pin keeps the stage; a pinned presenter's screen shows there.
+    if (_pinnedParticipant != null) return;
     _focusedIdentity = participant.identity;
     _focusedScreen = true;
     _fullScreen = false;
@@ -2520,13 +2787,256 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   }
 
   void _exitFullScreen() {
-    _focusedIdentity = null;
-    _focusedScreen = false;
-    _fullScreen = false;
+    _clearFocus();
     _refreshMeeting();
   }
 
+  void _clearFocus() {
+    _focusedIdentity = null;
+    _focusedScreen = false;
+    _fullScreen = false;
+  }
+
+  /// Who the host pinned, with the viewer's way out, or back in.
+  Widget? _pinBar() {
+    final pin = _roomPin;
+    final participant = pin == null
+        ? null
+        : _participants.where((p) => p.identity == pin).firstOrNull;
+    if (participant == null) return null;
+    final name = _participantDisplayName(participant);
+    final dismissed = _dismissedPin == pin;
+    final (text, action, onPressed) = _isHost
+        ? (
+            'Đang ghim $name cho cả phòng',
+            'Bỏ ghim',
+            () => _togglePin(participant),
+          )
+        : dismissed
+        ? (
+            'Chủ phòng đang ghim $name',
+            'Xem',
+            () {
+              _dismissedPin = null;
+              _clearFocus();
+              _refreshMeeting();
+            },
+          )
+        : (
+            'Chủ phòng đang ghim $name',
+            'Bỏ ghim',
+            () {
+              _dismissedPin = pin;
+              _clearFocus();
+              _refreshMeeting();
+            },
+          );
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      padding: const EdgeInsets.only(left: 12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF263952),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            dismissed ? Icons.push_pin_outlined : Icons.push_pin,
+            color: _pinColor,
+            size: 18,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+            ),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF9ACBFF),
+            ),
+            onPressed: onPressed,
+            child: Text(action, style: const TextStyle(fontSize: 12)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static const _pinColor = Color(0xFFFF5A5F);
+
+  Widget _pinButton(Participant participant, {double size = 34}) {
+    final pinned = _pinnedIdentity == participant.identity;
+    return _RequestActionButton(
+      size: size,
+      tooltip: pinned ? 'Bỏ ghim' : 'Ghim lên màn hình chính',
+      color: pinned ? _pinColor : Colors.white60,
+      icon: pinned ? Icons.push_pin : Icons.push_pin_outlined,
+      onPressed: () => _togglePin(participant),
+    );
+  }
+
+  Widget _buildLobby() {
+    final hostAway = _hostParticipant == null;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 420),
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 32),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1D1F24),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(
+                width: 30,
+                height: 30,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: Color(0xFF55B7FF),
+                ),
+              ),
+              const SizedBox(height: 22),
+              const Text(
+                'Đang chờ chủ phòng cho vào',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                hostAway
+                    ? 'Chủ phòng đang vắng. Bạn sẽ được duyệt khi chủ phòng quay lại.'
+                    : 'Chủ phòng đã nhận yêu cầu của bạn. Vui lòng chờ trong giây lát.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFFAAADB5),
+                  height: 1.45,
+                  fontSize: 14,
+                ),
+              ),
+              const SizedBox(height: 22),
+              OutlinedButton.icon(
+                onPressed: _exitApplication,
+                icon: const Icon(Icons.exit_to_app_rounded),
+                label: const Text('Rời phòng'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: const Color(0xFFFF7184),
+                  side: const BorderSide(color: Color(0xFFFF7184)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Shared by hand raises and the waiting room: how many wait, a look at
+  /// the list, and one tap to approve everyone.
+  Widget _requestBanner({
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String subtitle,
+    required VoidCallback onView,
+    required VoidCallback onApproveAll,
+  }) => Container(
+    margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    decoration: BoxDecoration(
+      gradient: const LinearGradient(
+        colors: [Color(0xFF202E48), Color(0xFF25243D)],
+      ),
+      borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: const Color(0xFF435A7A)),
+      boxShadow: const [
+        BoxShadow(
+          color: Color(0x30000000),
+          blurRadius: 12,
+          offset: Offset(0, 4),
+        ),
+      ],
+    ),
+    child: Row(
+      children: [
+        Container(
+          width: 38,
+          height: 38,
+          decoration: BoxDecoration(
+            color: const Color(0xFF31517A),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: iconColor, size: 21),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Color(0xFFB8C5D8), fontSize: 10),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 6),
+        TextButton(
+          style: TextButton.styleFrom(
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            minimumSize: const Size(0, 32),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          onPressed: onView,
+          child: const Text('Xem', style: TextStyle(fontSize: 12)),
+        ),
+        const SizedBox(width: 4),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            backgroundColor: const Color(0xFF168BE7),
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            minimumSize: const Size(0, 32),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          onPressed: onApproveAll,
+          child: const Text(
+            'Duyệt tất cả',
+            style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+          ),
+        ),
+      ],
+    ),
+  );
+
   Widget _buildMeeting(Room room) {
+    if (_inLobby) return _buildLobby();
     final keyboardVisible = MediaQuery.viewInsetsOf(context).bottom > 0;
     final chat = _chat;
     final participants = _participants;
@@ -2539,9 +3049,18 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final host = _hostParticipant;
     final sharing = participants.where((p) => p.isScreenShareEnabled()).toList()
       ..sort((a, b) => a.identity.compareTo(b.identity));
-    final center = focused ?? sharing.firstOrNull ?? host ?? participants.first;
+    // What this viewer tapped, then the host's pin, then a shared screen,
+    // then the host.
+    final pinned = _pinnedParticipant;
+    final center =
+        focused ?? pinned ?? sharing.firstOrNull ?? host ?? participants.first;
     final hostIdentity = host?.identity;
-    final showingScreen = focused != null ? _focusedScreen : sharing.isNotEmpty;
+    final showingScreen = focused != null
+        ? _focusedScreen
+        : pinned != null
+        ? pinned.isScreenShareEnabled()
+        : sharing.isNotEmpty;
+    final pinBar = keyboardVisible ? null : _pinBar();
     final others = participants
         .where((p) => showingScreen || p.identity != center.identity)
         .toList();
@@ -2586,6 +3105,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
               ),
             ),
           ),
+        ?pinBar,
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
@@ -2732,8 +3252,28 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
             },
           ),
         ),
+        if (_isHost && _joinRequests.isNotEmpty && !keyboardVisible)
+          _requestBanner(
+            icon: Icons.door_front_door_rounded,
+            iconColor: const Color(0xFF70C7FF),
+            title: '${_joinRequests.length} người xin vào',
+            subtitle: 'Đang ở phòng chờ',
+            onView: _showJoinRequestsSheet,
+            onApproveAll: () {
+              for (final identity in List.of(_joinRequests)) {
+                unawaited(_answerJoin(identity, admit: true));
+              }
+            },
+          ),
         if (_isHost && _waitingIdentities.isNotEmpty && !keyboardVisible)
-          _waitingBanner(),
+          _requestBanner(
+            icon: Icons.back_hand_rounded,
+            iconColor: const Color(0xFFFFD166),
+            title: '${_waitingIdentities.length} người giơ tay',
+            subtitle: 'Chờ duyệt quyền phát biểu',
+            onView: _showWaitingSheet,
+            onApproveAll: _showApprovalDialog,
+          ),
         _controlBar(),
       ],
     );
@@ -2933,6 +3473,34 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   _showParticipantsSheet();
                 },
               ),
+              // In portrait this sits in the app bar, which landscape hides.
+              if (_isHost && _isLandscape(context))
+                StatefulBuilder(
+                  builder: (context, setSheetState) => SwitchListTile(
+                    secondary: const Icon(
+                      Icons.door_front_door_outlined,
+                      color: Colors.white70,
+                    ),
+                    title: const Text(
+                      'Duyệt vào phòng',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                    subtitle: const Text(
+                      'Người mới vào phải chờ bạn cho vào mới xem được',
+                      style: TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                    value: _lobbyEnabled,
+                    activeThumbColor: const Color(0xFF43B5FF),
+                    onChanged: (value) async {
+                      // Flips at once; flips back if the host's metadata
+                      // could not be saved.
+                      final change = _setLobby(value);
+                      setSheetState(() {});
+                      await change;
+                      if (context.mounted) setSheetState(() {});
+                    },
+                  ),
+                ),
               if (_isHost && members.isNotEmpty)
                 ListTile(
                   leading: const Icon(
@@ -3114,6 +3682,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
               '$name${isHost ? ', Chủ phòng' : ''}, mic ${micEnabled ? 'bật' : 'tắt'}, camera ${cameraEnabled ? 'bật' : 'tắt'}. $actionLabel',
           child: GestureDetector(
             onTap: onTap,
+            onLongPress: _isHost ? () => _togglePin(participant) : null,
             child: Container(
               clipBehavior: Clip.antiAlias,
               decoration: BoxDecoration(
@@ -3228,12 +3797,29 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                     )
                   else
                     Positioned(
-                      top: 8,
-                      right: 8,
-                      child: Icon(
-                        cameraEnabled ? Icons.videocam : Icons.videocam_off,
-                        color: cameraEnabled ? Colors.white : Colors.white60,
-                        size: 18,
+                      top: _isHost ? 6 : 8,
+                      right: _isHost ? 6 : 8,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // The host's own tile; members only see the pin.
+                          if (_isHost)
+                            _pinButton(participant, size: large ? 34 : 28)
+                          else if (_roomPin == participant.identity)
+                            const Icon(
+                              Icons.push_pin,
+                              color: _pinColor,
+                              size: 18,
+                            ),
+                          const SizedBox(width: 6),
+                          Icon(
+                            cameraEnabled ? Icons.videocam : Icons.videocam_off,
+                            color: cameraEnabled
+                                ? Colors.white
+                                : Colors.white60,
+                            size: 18,
+                          ),
+                        ],
                       ),
                     ),
                   Positioned(
@@ -3290,7 +3876,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
   /// so they stay readable over video.
   Widget _memberControls(Participant participant, {required bool large}) {
     final size = large ? 34.0 : 28.0;
-    final gap = SizedBox(width: large ? 8 : 6);
+    // Four buttons still fit a 142 px thumbnail.
+    final gap = SizedBox(width: large ? 8 : 4);
     return Container(
       padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
@@ -3305,6 +3892,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
           _memberMediaButton(participant, _MemberMedia.camera, size: size),
           gap,
           _memberMediaButton(participant, _MemberMedia.screenShare, size: size),
+          gap,
+          _pinButton(participant, size: size),
         ],
       ),
     );
@@ -3341,99 +3930,6 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     final liveKitName = participant.name.trim();
     return liveKitName.isNotEmpty ? liveKitName : participant.identity;
   }
-
-  Widget _waitingBanner() => Container(
-    margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-    decoration: BoxDecoration(
-      gradient: const LinearGradient(
-        colors: [Color(0xFF202E48), Color(0xFF25243D)],
-      ),
-      borderRadius: BorderRadius.circular(16),
-      border: Border.all(color: const Color(0xFF435A7A)),
-      boxShadow: const [
-        BoxShadow(
-          color: Color(0x30000000),
-          blurRadius: 12,
-          offset: Offset(0, 4),
-        ),
-      ],
-    ),
-    child: Row(
-      children: [
-        Container(
-          width: 38,
-          height: 38,
-          decoration: BoxDecoration(
-            color: const Color(0xFF31517A),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: const Icon(
-            Icons.back_hand_rounded,
-            color: Color(0xFFFFD166),
-            size: 21,
-          ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                '${_waitingIdentities.length} yêu cầu phát biểu',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 12,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(height: 2),
-              const Text(
-                'Thành viên chờ duyệt',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: Color(0xFFB8C5D8), fontSize: 10),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(width: 6),
-        Tooltip(
-          message: 'Cấp mic và quyền chia sẻ màn hình cho tất cả',
-          child: TextButton(
-            style: TextButton.styleFrom(
-              foregroundColor: const Color(0xFF9ACBFF),
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-              minimumSize: Size.zero,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
-            onPressed: _showApprovalDialog,
-            child: const Text(
-              'Duyệt tất cả',
-              maxLines: 1,
-              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-            ),
-          ),
-        ),
-        TextButton(
-          style: TextButton.styleFrom(
-            foregroundColor: Colors.white,
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-            minimumSize: Size.zero,
-            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          ),
-          onPressed: _showWaitingSheet,
-          child: const Text(
-            'Xem',
-            style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
-          ),
-        ),
-      ],
-    ),
-  );
 
   Widget _controlBar() {
     final screenShareActive = _screenShare?.active ?? false;
@@ -3673,6 +4169,8 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       ? Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            _pinButton(participant),
+                            const SizedBox(width: 6),
                             for (final media in _MemberMedia.values) ...[
                               if (media != _MemberMedia.microphone)
                                 const SizedBox(width: 6),
@@ -3683,6 +4181,11 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                       : Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            // The host's own row.
+                            if (_isHost) ...[
+                              _pinButton(participant),
+                              const SizedBox(width: 12),
+                            ],
                             Icon(
                               micEnabled ? Icons.mic : Icons.mic_off,
                               color: micEnabled
@@ -3722,7 +4225,45 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
       'được chủ phòng. BE cần cấp canPublishData=true.';
 
   /// The host drags it up when many members wait, or down to close it.
-  void _showWaitingSheet() => showModalBottomSheet<void>(
+  void _showWaitingSheet() => _showRequestSheet(
+    icon: Icons.front_hand_rounded,
+    title: 'Yêu cầu phát biểu',
+    subtitle: 'Duyệt quyền mic hoặc chia sẻ màn hình',
+    status: 'Đang chờ host duyệt',
+    identities: _waitingIdentities,
+    onApprove: (sheetContext, identity) {
+      Navigator.pop(sheetContext);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_showApprovalDialog(identity));
+      });
+    },
+    onReject: (sheetContext, identity) {
+      Navigator.pop(sheetContext);
+      unawaited(_reject(identity));
+    },
+  );
+
+  void _showJoinRequestsSheet() => _showRequestSheet(
+    icon: Icons.door_front_door_rounded,
+    title: 'Người xin vào phòng',
+    subtitle: 'Cho vào thì họ mới xem được',
+    status: 'Đang ở phòng chờ',
+    identities: _joinRequests,
+    // The list updates in place, so the host can answer several in a row.
+    onApprove: (_, identity) => unawaited(_answerJoin(identity, admit: true)),
+    onReject: (_, identity) => unawaited(_answerJoin(identity, admit: false)),
+  );
+
+  void _showRequestSheet({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required String status,
+    required Set<String> identities,
+    required void Function(BuildContext sheetContext, String identity)
+    onApprove,
+    required void Function(BuildContext sheetContext, String identity) onReject,
+  }) => showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     useSafeArea: true,
@@ -3751,8 +4292,15 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
               slivers: [
                 // Pinned inside the scroll view, so dragging the header
                 // resizes the sheet too.
-                PinnedHeaderSliver(child: _waitingSheetHeader()),
-                if (_waitingIdentities.isEmpty)
+                PinnedHeaderSliver(
+                  child: _requestSheetHeader(
+                    icon: icon,
+                    title: title,
+                    subtitle: subtitle,
+                    count: identities.length,
+                  ),
+                ),
+                if (identities.isEmpty)
                   SliverToBoxAdapter(
                     child: Padding(
                       padding: EdgeInsets.fromLTRB(
@@ -3781,12 +4329,17 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   SliverPadding(
                     padding: EdgeInsets.fromLTRB(16, 14, 16, 20 + bottomInset),
                     sliver: SliverList.separated(
-                      itemCount: _waitingIdentities.length,
+                      itemCount: identities.length,
                       separatorBuilder: (_, _) => const SizedBox(height: 10),
-                      itemBuilder: (context, index) => _waitingRequestTile(
-                        sheetContext,
-                        _waitingIdentities.elementAt(index),
-                      ),
+                      itemBuilder: (context, index) {
+                        final identity = identities.elementAt(index);
+                        return _requestTile(
+                          identity,
+                          status: status,
+                          onApprove: () => onApprove(sheetContext, identity),
+                          onReject: () => onReject(sheetContext, identity),
+                        );
+                      },
                     ),
                   ),
               ],
@@ -3797,7 +4350,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     ),
   );
 
-  Widget _waitingSheetHeader() => ColoredBox(
+  Widget _requestSheetHeader({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required int count,
+  }) => ColoredBox(
     // Opaque, so requests scroll under the pinned header.
     color: _waitingSheetColor,
     child: Column(
@@ -3823,28 +4381,28 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   color: const Color(0xFF43B5FF).withValues(alpha: 0.14),
                   borderRadius: BorderRadius.circular(15),
                 ),
-                child: const Icon(
-                  Icons.front_hand_rounded,
-                  color: Color(0xFF70C7FF),
-                ),
+                child: Icon(icon, color: const Color(0xFF70C7FF)),
               ),
               const SizedBox(width: 12),
-              const Expanded(
+              Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Yêu cầu phát biểu',
-                      style: TextStyle(
+                      title,
+                      style: const TextStyle(
                         color: Colors.white,
                         fontSize: 19,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
-                    SizedBox(height: 3),
+                    const SizedBox(height: 3),
                     Text(
-                      'Duyệt quyền mic hoặc chia sẻ màn hình',
-                      style: TextStyle(color: Colors.white60, fontSize: 12),
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white60,
+                        fontSize: 12,
+                      ),
                     ),
                   ],
                 ),
@@ -3859,7 +4417,7 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   borderRadius: BorderRadius.circular(20),
                 ),
                 child: Text(
-                  '${_waitingIdentities.length}',
+                  '$count',
                   style: const TextStyle(
                     color: Color(0xFF70C7FF),
                     fontWeight: FontWeight.w700,
@@ -3874,7 +4432,12 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
     ),
   );
 
-  Widget _waitingRequestTile(BuildContext sheetContext, String identity) {
+  Widget _requestTile(
+    String identity, {
+    required String status,
+    required VoidCallback onApprove,
+    required VoidCallback onReject,
+  }) {
     final participant = _participants
         .where((value) => value.identity == identity)
         .firstOrNull;
@@ -3916,34 +4479,26 @@ class _LiveKitDemoPageState extends State<LiveKitDemoPage> {
                   ),
                 ),
                 const SizedBox(height: 3),
-                const Text(
-                  'Đang chờ host duyệt',
-                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                Text(
+                  status,
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
                 ),
               ],
             ),
           ),
           const SizedBox(width: 8),
           _RequestActionButton(
-            tooltip: 'Duyệt quyền',
+            tooltip: 'Duyệt',
             color: const Color(0xFF35C98B),
             icon: Icons.check_rounded,
-            onPressed: () {
-              Navigator.pop(sheetContext);
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (mounted) unawaited(_showApprovalDialog(identity));
-              });
-            },
+            onPressed: onApprove,
           ),
           const SizedBox(width: 4),
           _RequestActionButton(
             tooltip: 'Từ chối',
             color: const Color(0xFFFF657A),
             icon: Icons.close_rounded,
-            onPressed: () {
-              Navigator.pop(sheetContext);
-              unawaited(_reject(identity));
-            },
+            onPressed: onReject,
           ),
         ],
       ),
